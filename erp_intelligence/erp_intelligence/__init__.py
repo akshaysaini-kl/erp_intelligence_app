@@ -1,0 +1,1 @@
+"""ERP Intelligence Frappe module."""
