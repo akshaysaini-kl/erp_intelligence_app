@@ -35,22 +35,40 @@ class ContextService:
         doctype: str,
         value: str,
         user: str | None = None,
+        *,
+        parent_doctype: str | None = None,
+        parent_fieldname: str | None = None,
     ) -> dict[str, Any]:
-        """Resolve an authorized fieldname or label within one DocType."""
-        field_query = cls._validate_term(value, "field")
-        doctype_result, context = cls._resolve_doctype_context(doctype, user)
-        if context is None:
-            return {
-                "resolved_value": None,
-                "resolution_type": "doctype",
-                "match_status": f"doctype_{doctype_result['match_status']}",
-                "confidence": "none",
-                "candidates": doctype_result["candidates"],
-                "doctype": None,
-            }
+        """Resolve an authorized fieldname or label within one DocType.
 
-        metadata = context["metadata"]
-        policy = FieldPolicy.get_field_policy(metadata, user=context["user"])
+        Child DocTypes cannot be resolved by name, so their fields are resolved
+        with an explicit parent context. Access is then decided by FieldPolicy
+        under that parent, exactly as for any other child-table read.
+        """
+        field_query = cls._validate_term(value, "field")
+        if parent_doctype is None and parent_fieldname is None:
+            doctype_result, context = cls._resolve_doctype_context(doctype, user)
+            if context is None:
+                return {
+                    "resolved_value": None,
+                    "resolution_type": "doctype",
+                    "match_status": f"doctype_{doctype_result['match_status']}",
+                    "confidence": "none",
+                    "candidates": doctype_result["candidates"],
+                    "doctype": None,
+                }
+
+            metadata = context["metadata"]
+            descriptor = context["descriptor"]
+            policy = FieldPolicy.get_field_policy(metadata, user=context["user"])
+        else:
+            metadata, descriptor, policy = cls._child_field_policy(
+                doctype,
+                user,
+                parent_doctype,
+                parent_fieldname,
+            )
+
         readable_fields = policy.get("readable_fields")
         if not isinstance(readable_fields, list):
             frappe.throw(
@@ -70,8 +88,48 @@ class ContextService:
             exact_name_key="fieldname",
             resolution_prefix="field",
         )
-        result["doctype"] = context["descriptor"]
+        result["doctype"] = descriptor
         return result
+
+    @classmethod
+    def _child_field_policy(
+        cls,
+        doctype: str,
+        user: str | None,
+        parent_doctype: str | None,
+        parent_fieldname: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        authenticated_user = cls._get_authenticated_user(user)
+        if (
+            not isinstance(parent_doctype, str)
+            or not parent_doctype
+            or not isinstance(parent_fieldname, str)
+            or not parent_fieldname
+        ):
+            frappe.throw(
+                _("parent_doctype and parent_fieldname must be provided together"),
+                frappe.ValidationError,
+            )
+
+        metadata = MetadataService.get_doctype_metadata(doctype)
+        if not metadata.get("istable"):
+            frappe.throw(
+                _("Parent context is only valid for child DocTypes"),
+                frappe.ValidationError,
+            )
+
+        policy = FieldPolicy.get_field_policy(
+            metadata,
+            user=authenticated_user,
+            parent_doctype=parent_doctype,
+            parent_fieldname=parent_fieldname,
+        )
+        descriptor = {
+            "candidate_type": "doctype",
+            "name": metadata["doctype"],
+            "label": cls._doctype_label(metadata["label"]),
+        }
+        return metadata, descriptor, policy
 
     @classmethod
     def discover_relationships(

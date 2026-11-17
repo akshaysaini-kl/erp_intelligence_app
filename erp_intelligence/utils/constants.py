@@ -127,6 +127,7 @@ LIMIT_DEFINITIONS = MappingProxyType(
         "filters": LimitDefinition("erp_intelligence_max_filters", 50, 1, 100),
         "sort_fields": LimitDefinition("erp_intelligence_max_sort_fields", 3, 1, 5),
         "filter_values": LimitDefinition("erp_intelligence_max_filter_values", 100, 1, 500),
+        "parent_names": LimitDefinition("erp_intelligence_max_parent_names", 50, 1, 200),
         "string_length": LimitDefinition(
             "erp_intelligence_max_filter_string_length",
             1_000,
@@ -168,6 +169,7 @@ QUERY_LIMIT_NAMES = (
     "filters",
     "sort_fields",
     "filter_values",
+    "parent_names",
     "string_length",
     "aggregations",
     "group_by_fields",

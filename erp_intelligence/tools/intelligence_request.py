@@ -26,10 +26,12 @@ class IntelligenceRequest(BaseTool):
             "offset",
             "aggregations",
             "group_by",
+            "parent_context",
         }
     )
     _ALLOWED_ARGUMENTS = _REQUEST_ARGUMENTS | {"user"}
     _MAX_REFERENCE_LENGTH = 256
+    _MAX_PARENT_NAME_LENGTH = 140
     _REFERENCE_FORBIDDEN_CHARACTERS = frozenset({".", "`"})
 
     def __init__(self) -> None:
@@ -45,7 +47,12 @@ class IntelligenceRequest(BaseTool):
             "{field, direction}, and aggregations as {operation, field} with "
             "optional group_by. Send either a record request (fields, sort, "
             "page_length, offset) or an aggregation request (aggregations, "
-            "group_by), not both. The result is one of: executed records or "
+            "group_by), not both. To read child-table rows, such as the items "
+            "of specific Sales Orders, set doctype to the child DocType (for "
+            "example 'Sales Order Item') and supply parent_context with the "
+            "parent DocType and the exact parent document names; only record "
+            "requests accept parent_context, and rows are returned only for "
+            "parents the user may read. The result is one of: executed records or "
             "aggregation values (result_type 'intelligence_execution'); a "
             "'query_plan' with status 'needs_clarification' listing "
             "ambiguous references and candidate choices; a 'query_plan' with "
@@ -160,6 +167,38 @@ class IntelligenceRequest(BaseTool):
                         "aggregations."
                     ),
                 },
+                "parent_context": {
+                    "type": "object",
+                    "properties": {
+                        "parent_doctype": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": self._MAX_REFERENCE_LENGTH,
+                            "description": "DocType that owns the child table, e.g. Sales Order.",
+                        },
+                        "parent_names": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": self._MAX_PARENT_NAME_LENGTH,
+                            },
+                            "description": (
+                                "Exact names of the parent documents whose child "
+                                "rows are wanted."
+                            ),
+                        },
+                    },
+                    "required": ["parent_doctype", "parent_names"],
+                    "additionalProperties": False,
+                    "description": (
+                        "Required when doctype is a child table. Child rows are "
+                        "returned only for the named parents the user can read. "
+                        "Record requests only."
+                    ),
+                },
                 "user": {
                     "type": "string",
                     "minLength": 1,
@@ -203,6 +242,15 @@ class IntelligenceRequest(BaseTool):
     @classmethod
     def _validate_references(cls, request: Mapping[str, Any]) -> None:
         cls._validate_reference(request.get("doctype"), "doctype")
+
+        parent_context = request.get("parent_context")
+        if isinstance(parent_context, Mapping):
+            # Parent document names may legitimately contain dots, so only the
+            # DocType reference is checked here; names are validated by QueryValidator.
+            cls._validate_reference(
+                parent_context.get("parent_doctype"),
+                "parent_context.parent_doctype",
+            )
 
         for key in ("fields", "group_by"):
             values = request.get(key)

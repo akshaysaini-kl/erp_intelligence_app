@@ -41,8 +41,10 @@ class QueryValidator:
             "offset",
             "parent_doctype",
             "parent_fieldname",
+            "parent_names",
         }
     )
+    _MAX_PARENT_NAME_LENGTH = 140  # Frappe document name length limit
     _ALLOWED_FILTER_KEYS = frozenset({"field", "operator", "value"})
     _ALLOWED_SORT_KEYS = frozenset({"field", "direction"})
     _SUPPORTED_OPERATORS = frozenset(
@@ -105,6 +107,7 @@ class QueryValidator:
 
         metadata = MetadataService.get_doctype_metadata(request.get("doctype"))
         parent_doctype, parent_fieldname = cls._validate_parent_context(request, metadata)
+        parent_names = cls._validate_parent_names(request, metadata, limit_snapshot)
         policy = FieldPolicy.get_field_policy(
             metadata,
             user=user,
@@ -156,6 +159,7 @@ class QueryValidator:
             "offset": offset,
             "parent_doctype": parent_doctype,
             "parent_fieldname": parent_fieldname,
+            "parent_names": parent_names,
         }
 
     @classmethod
@@ -202,6 +206,11 @@ class QueryValidator:
                     frappe.ValidationError,
                 )
             cls._validate_field_identifier(parent_fieldname)
+            cls._validate_parent_relationship(
+                metadata["doctype"],
+                parent_doctype,
+                parent_fieldname,
+            )
         elif parent_doctype or parent_fieldname:
             frappe.throw(
                 _("Parent context is only valid for child DocTypes"),
@@ -209,6 +218,81 @@ class QueryValidator:
             )
 
         return parent_doctype, parent_fieldname
+
+    @staticmethod
+    def _validate_parent_relationship(
+        child_doctype: str,
+        parent_doctype: str,
+        parent_fieldname: str,
+    ) -> None:
+        """Require, from live metadata, that parent_fieldname is a Table of child_doctype."""
+        try:
+            table_fieldnames = MetadataService.get_child_table_fieldnames(
+                parent_doctype,
+                child_doctype,
+            )
+        except frappe.DoesNotExistError:
+            frappe.throw(_("Invalid parent DocType"), frappe.ValidationError)
+
+        if parent_fieldname not in table_fieldnames:
+            frappe.throw(
+                _("{0} is not a child table of {1}").format(child_doctype, parent_doctype),
+                frappe.ValidationError,
+            )
+
+    @classmethod
+    def _validate_parent_names(
+        cls,
+        request: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+        limit_snapshot: Mapping[str, int] | None,
+    ) -> list[str] | None:
+        """Validate the explicit parent document names of a child-table query.
+
+        The parent_names limit is only resolved for child DocTypes, so ordinary
+        queries never depend on it.
+        """
+        value = request.get("parent_names")
+        if not metadata.get("istable"):
+            if value is not None:
+                frappe.throw(
+                    _("Parent context is only valid for child DocTypes"),
+                    frappe.ValidationError,
+                )
+            return None
+
+        if not isinstance(value, list) or not value:
+            frappe.throw(
+                _("parent_names must be a non-empty list"),
+                frappe.ValidationError,
+            )
+
+        maximum = ConfigService.resolve_limits("parent_names", snapshot=limit_snapshot)[
+            "parent_names"
+        ]
+        if len(value) > maximum:
+            frappe.throw(
+                _("parent_names cannot contain more than {0} entries").format(maximum),
+                frappe.ValidationError,
+            )
+
+        normalized = []
+        seen = set()
+        for name in value:
+            if (
+                not isinstance(name, str)
+                or not name
+                or name != name.strip()
+                or len(name) > cls._MAX_PARENT_NAME_LENGTH
+                or cls._CONTROL_CHARACTER_PATTERN.search(name)
+            ):
+                frappe.throw(_("Invalid parent document name"), frappe.ValidationError)
+            if name in seen:
+                frappe.throw(_("Duplicate parent document name"), frappe.ValidationError)
+            seen.add(name)
+            normalized.append(name)
+
+        return normalized
 
     @classmethod
     def _validate_fields(

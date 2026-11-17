@@ -31,9 +31,11 @@ class QueryPlanner:
             "offset",
             "aggregations",
             "group_by",
+            "parent_context",
             "user",
         }
     )
+    _PARENT_CONTEXT_KEYS = frozenset({"parent_doctype", "parent_names"})
     _FILTER_KEYS = frozenset({"field", "operator", "value"})
     _SORT_KEYS = frozenset({"field", "direction"})
     _AGGREGATION_KEYS = frozenset({"operation", "field"})
@@ -68,6 +70,18 @@ class QueryPlanner:
             limit_snapshot = ConfigService.get_limit_snapshot()
         limits = cls._get_limits(limit_snapshot)
         cls._validate_outer_structure(request, plan_type, limits)
+
+        if "parent_context" in request:
+            if plan_type != "records":
+                frappe.throw(
+                    _("parent_context is only supported for record requests"),
+                    frappe.ValidationError,
+                )
+            return cls._plan_child_records(
+                request,
+                authenticated_user,
+                limit_snapshot,
+            )
 
         doctype_reference = request["doctype"]
         doctype_resolution = ContextService.resolve_doctype(
@@ -195,6 +209,198 @@ class QueryPlanner:
         return cls._ready_response("records", doctype, plan, resolutions)
 
     @classmethod
+    def _plan_child_records(
+        cls,
+        request: Mapping[str, Any],
+        user: str,
+        limit_snapshot: Mapping[str, int],
+    ) -> dict[str, Any]:
+        """Plan a record query over one child table of explicitly named parents."""
+        parent_reference, _parent_names = cls._validate_parent_context_shape(
+            request["parent_context"]
+        )
+
+        parent_resolution = ContextService.resolve_doctype(parent_reference, user=user)
+        if parent_resolution.get("match_status") != "resolved":
+            issue = cls._resolution_issue(
+                "/parent_context/parent_doctype",
+                parent_reference,
+                parent_resolution,
+            )
+            return cls._non_executable_response("records", issues=[issue], resolutions=[])
+
+        parent_value = parent_resolution.get("resolved_value")
+        if not isinstance(parent_value, Mapping) or not isinstance(parent_value.get("name"), str):
+            frappe.throw(
+                _("Unable to establish canonical DocType context"),
+                frappe.PermissionError,
+            )
+        parent_doctype = parent_value["name"]
+        cls._validate_execution_target(parent_doctype)
+
+        child_doctype, parent_fieldname, child_resolution = cls._resolve_child_doctype(
+            request["doctype"],
+            parent_doctype,
+        )
+        resolutions = [
+            cls._resolution_record(
+                "/parent_context/parent_doctype",
+                parent_reference,
+                parent_doctype,
+                parent_resolution,
+            ),
+            cls._resolution_record(
+                "/doctype",
+                request["doctype"],
+                child_doctype,
+                child_resolution,
+            ),
+        ]
+
+        parent = {"parent_doctype": parent_doctype, "parent_fieldname": parent_fieldname}
+        issues: list[dict[str, Any]] = []
+        cache: dict[str, dict[str, Any]] = {}
+        fields = cls._resolve_field_list(
+            child_doctype,
+            request["fields"],
+            "/fields",
+            user,
+            cache,
+            issues,
+            resolutions,
+            parent,
+        )
+        filters = cls._resolve_filters(
+            child_doctype,
+            request.get("filters", []),
+            user,
+            cache,
+            issues,
+            resolutions,
+            parent,
+        )
+        sort = cls._resolve_sort(
+            child_doctype,
+            request.get("sort", []),
+            user,
+            cache,
+            issues,
+            resolutions,
+            parent,
+        )
+        if issues:
+            return cls._non_executable_response(
+                "records",
+                issues=issues,
+                resolutions=resolutions,
+                doctype=child_doctype,
+            )
+
+        validation_request: dict[str, Any] = {
+            "doctype": child_doctype,
+            "fields": fields,
+            "filters": filters,
+            "sort": sort,
+            "parent_doctype": parent_doctype,
+            "parent_fieldname": parent_fieldname,
+            "parent_names": request["parent_context"]["parent_names"],
+        }
+        if "page_length" in request:
+            validation_request["page_length"] = request["page_length"]
+        if "offset" in request:
+            validation_request["offset"] = request["offset"]
+
+        # QueryValidator re-verifies the relationship from live metadata, applies
+        # FieldPolicy under the parent context, and enforces every limit.
+        validated = QueryValidator.validate_query(
+            validation_request,
+            user=user,
+            limit_snapshot=limit_snapshot,
+        )
+        plan = {
+            "doctype": validated["doctype"],
+            "fields": validated["fields"],
+            "filters": validated["filters"],
+            "sort": validated["sort"],
+            "page_length": validated["page_length"],
+            "offset": validated["offset"],
+            "parent_doctype": validated["parent_doctype"],
+            "parent_fieldname": validated["parent_fieldname"],
+            "parent_names": validated["parent_names"],
+        }
+        return cls._ready_response("records", child_doctype, plan, resolutions)
+
+    @classmethod
+    def _validate_parent_context_shape(cls, value: Any) -> tuple[str, list[Any]]:
+        if not isinstance(value, Mapping) or set(value) != cls._PARENT_CONTEXT_KEYS:
+            frappe.throw(
+                _("parent_context must contain exactly: {0}").format(
+                    ", ".join(sorted(cls._PARENT_CONTEXT_KEYS))
+                ),
+                frappe.ValidationError,
+            )
+
+        parent_reference = cls._require_reference(value["parent_doctype"], "parent_doctype")
+        parent_names = value["parent_names"]
+        if not isinstance(parent_names, list) or not parent_names:
+            frappe.throw(
+                _("parent_names must be a non-empty list"),
+                frappe.ValidationError,
+            )
+        return parent_reference, parent_names
+
+    @classmethod
+    def _resolve_child_doctype(
+        cls,
+        reference: Any,
+        parent_doctype: str,
+    ) -> tuple[str, str, dict[str, str]]:
+        """Match the requested child DocType against the parent's own Table fields."""
+        if not isinstance(reference, str) or not reference.strip():
+            frappe.throw(_("doctype must be a non-empty string"), frappe.ValidationError)
+        reference = reference.strip()
+
+        def normalize(value: str) -> str:
+            return " ".join(value.split()).casefold()
+
+        children = {
+            field["child_doctype"]
+            for field in MetadataService.get_doctype_metadata(parent_doctype)["fields"]
+            if isinstance(field.get("child_doctype"), str) and field["child_doctype"]
+        }
+        matches = [name for name in children if name == reference]
+        resolution = {"resolution_type": "exact_child_table_name", "confidence": "exact"}
+        if not matches:
+            matches = [name for name in children if normalize(name) == normalize(reference)]
+            resolution = {
+                "resolution_type": "case_insensitive_child_table_name",
+                "confidence": "case_insensitive",
+            }
+        if len(matches) != 1:
+            # Unknown, not a child table at all, or a child of a different parent.
+            frappe.throw(
+                _("{0} is not a child table of {1}").format(reference, parent_doctype),
+                frappe.ValidationError,
+            )
+
+        child_doctype = matches[0]
+        fieldnames = MetadataService.get_child_table_fieldnames(parent_doctype, child_doctype)
+        if not fieldnames:
+            frappe.throw(
+                _("{0} is not a child table of {1}").format(reference, parent_doctype),
+                frappe.ValidationError,
+            )
+        if len(fieldnames) > 1:
+            frappe.throw(
+                _(
+                    "{0} is used by more than one table field of {1}; "
+                    "such requests are not supported"
+                ).format(child_doctype, parent_doctype),
+                frappe.ValidationError,
+            )
+        return child_doctype, fieldnames[0], resolution
+
+    @classmethod
     def _plan_aggregation(
         cls,
         request: Mapping[str, Any],
@@ -301,6 +507,7 @@ class QueryPlanner:
         cache: dict[str, dict[str, Any]],
         issues: list[dict[str, Any]],
         resolutions: list[dict[str, Any]],
+        parent: Mapping[str, str] | None = None,
     ) -> list[str]:
         resolved = []
         for index, reference in enumerate(references):
@@ -312,6 +519,7 @@ class QueryPlanner:
                 cache,
                 issues,
                 resolutions,
+                parent,
             )
             if fieldname is not None:
                 resolved.append(fieldname)
@@ -326,6 +534,7 @@ class QueryPlanner:
         cache: dict[str, dict[str, Any]],
         issues: list[dict[str, Any]],
         resolutions: list[dict[str, Any]],
+        parent: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         resolved = []
         for index, item in enumerate(filters):
@@ -337,6 +546,7 @@ class QueryPlanner:
                 cache,
                 issues,
                 resolutions,
+                parent,
             )
             if fieldname is not None:
                 resolved.append(
@@ -357,6 +567,7 @@ class QueryPlanner:
         cache: dict[str, dict[str, Any]],
         issues: list[dict[str, Any]],
         resolutions: list[dict[str, Any]],
+        parent: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         resolved = []
         for index, item in enumerate(sort):
@@ -368,6 +579,7 @@ class QueryPlanner:
                 cache,
                 issues,
                 resolutions,
+                parent,
             )
             if fieldname is not None:
                 resolved.append({"field": fieldname, "direction": item["direction"]})
@@ -383,13 +595,23 @@ class QueryPlanner:
         cache: dict[str, dict[str, Any]],
         issues: list[dict[str, Any]],
         resolutions: list[dict[str, Any]],
+        parent: Mapping[str, str] | None = None,
     ) -> str | None:
         if reference not in cache:
-            cache[reference] = ContextService.resolve_field(
-                doctype,
-                reference,
-                user=user,
-            )
+            if parent is None:
+                cache[reference] = ContextService.resolve_field(
+                    doctype,
+                    reference,
+                    user=user,
+                )
+            else:
+                cache[reference] = ContextService.resolve_field(
+                    doctype,
+                    reference,
+                    user=user,
+                    parent_doctype=parent["parent_doctype"],
+                    parent_fieldname=parent["parent_fieldname"],
+                )
         result = cache[reference]
         if result.get("match_status") != "resolved":
             issues.append(cls._resolution_issue(location, reference, result))

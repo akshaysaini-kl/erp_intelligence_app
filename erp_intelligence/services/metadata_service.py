@@ -23,6 +23,14 @@ class MetadataService:
         ("docstatus", "Document Status", "Int", None, True),
     )
 
+    # Row columns of child DocTypes. Same tuple layout as _STANDARD_FIELDS.
+    _CHILD_STANDARD_FIELDS = (
+        ("name", "ID", "Data", None, False),
+        ("parent", "Parent", "Data", None, False),
+        ("parentfield", "Parent Field", "Data", None, False),
+        ("idx", "Row No", "Int", None, False),
+    )
+
     @classmethod
     def get_doctype_metadata(cls, doctype: str) -> dict[str, Any]:
         """Return normalized live metadata for a Frappe DocType.
@@ -56,20 +64,21 @@ class MetadataService:
     def get_standard_field_definitions(cls, meta: Any) -> list[dict[str, Any]]:
         """Return the standard field definitions that apply to a live DocType.
 
-        Child, Single, and virtual DocTypes have no queryable standard columns.
-        ``docstatus`` applies only to submittable DocTypes. A real DocField with
-        the same fieldname always takes precedence over a standard definition.
+        Single and virtual DocTypes have no queryable standard columns. Child
+        DocTypes expose only their row columns (``name``, ``parent``,
+        ``parentfield``, ``idx``). ``docstatus`` applies only to submittable
+        DocTypes. A real DocField with the same fieldname always takes
+        precedence over a standard definition.
         """
-        if (
-            bool(getattr(meta, "istable", False))
-            or bool(getattr(meta, "issingle", False))
-            or bool(getattr(meta, "is_virtual", False))
-        ):
+        if bool(getattr(meta, "issingle", False)) or bool(getattr(meta, "is_virtual", False)):
             return []
+
+        is_child = bool(getattr(meta, "istable", False))
+        standard_fields = cls._CHILD_STANDARD_FIELDS if is_child else cls._STANDARD_FIELDS
 
         is_submittable = bool(getattr(meta, "is_submittable", False))
         definitions = []
-        for fieldname, label, fieldtype, options, requires_submittable in cls._STANDARD_FIELDS:
+        for fieldname, label, fieldtype, options, requires_submittable in standard_fields:
             if requires_submittable and not is_submittable:
                 continue
             if meta.get_field(fieldname) is not None:
@@ -96,6 +105,31 @@ class MetadataService:
             if definition["fieldname"] == fieldname:
                 return frappe._dict(definition)
         return None
+
+    @classmethod
+    def get_child_table_fieldnames(cls, parent_doctype: str, child_doctype: str) -> list[str]:
+        """Return the Table fieldnames of ``parent_doctype`` whose rows are ``child_doctype``.
+
+        The result comes only from live metadata. It is empty when the parent has
+        no such table, when ``child_doctype`` is not a child DocType, or when
+        ``parent_doctype`` is itself a child DocType. Raises
+        ``frappe.DoesNotExistError`` if either DocType does not exist.
+        """
+        parent_meta = frappe.get_meta(cls._validate_doctype(parent_doctype))
+        child_meta = frappe.get_meta(cls._validate_doctype(child_doctype))
+
+        if bool(getattr(parent_meta, "istable", False)) or not bool(
+            getattr(child_meta, "istable", False)
+        ):
+            return []
+
+        return [
+            field.fieldname
+            for field in parent_meta.fields
+            if getattr(field, "fieldtype", None) in cls._TABLE_FIELD_TYPES
+            and getattr(field, "options", None) == child_meta.name
+            and getattr(field, "fieldname", None)
+        ]
 
     @staticmethod
     def _validate_doctype(doctype: str) -> str:
