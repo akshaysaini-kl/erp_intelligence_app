@@ -7,7 +7,11 @@ from typing import Any
 import frappe
 from frappe import _
 
-from erp_intelligence.utils.constants import LIMIT_DEFINITIONS, QUERY_LIMIT_NAMES
+from erp_intelligence.utils.constants import (
+    CHILD_AGGREGATION_LIMIT_NAMES,
+    LIMIT_DEFINITIONS,
+    QUERY_LIMIT_NAMES,
+)
 
 _MISSING = object()
 
@@ -108,6 +112,46 @@ class ConfigService:
         configuration changes mid-request. It is never stored or reused.
         """
         return MappingProxyType(cls.get_limits(*QUERY_LIMIT_NAMES))
+
+    @classmethod
+    def extend_limit_snapshot(
+        cls,
+        snapshot: Mapping[str, int],
+        *names: str,
+    ) -> Mapping[str, int]:
+        """Return a read-only snapshot that also carries the named limits.
+
+        The given snapshot is validated first and is never modified. Only names that
+        it does not already carry are resolved, and they are resolved and validated
+        here, through ``get_limit``, so a malformed setting raises at this point. A
+        name the snapshot already carries keeps the value it has, so extending is
+        idempotent and a request still has exactly one value per limit. The result
+        is re-validated against the application ceilings whenever it is used, like
+        any snapshot.
+
+        This is how a limit that only one feature uses is added to a request's
+        snapshot, instead of every request paying for, and being broken by, it.
+        """
+        cls._validate_limit_snapshot(snapshot)
+        missing = [name for name in dict.fromkeys(names) if name not in snapshot]
+        if not missing:
+            return snapshot
+        return MappingProxyType({**snapshot, **cls.get_limits(*missing)})
+
+    @classmethod
+    def get_child_aggregation_limit_snapshot(
+        cls,
+        snapshot: Mapping[str, int] | None = None,
+    ) -> Mapping[str, int]:
+        """Return the request snapshot extended with the child-aggregation limits.
+
+        Call this only for a request that carries ``parent_scope``. Resolving the
+        child-aggregation limits, and so validating their site configuration, then
+        happens only for child aggregation. Without ``snapshot`` the base snapshot
+        is taken first. The base limits are unchanged and validated as before.
+        """
+        base = cls.get_limit_snapshot() if snapshot is None else snapshot
+        return cls.extend_limit_snapshot(base, *CHILD_AGGREGATION_LIMIT_NAMES)
 
     @classmethod
     def resolve_limits(

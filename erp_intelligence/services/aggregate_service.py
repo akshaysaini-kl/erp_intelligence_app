@@ -372,6 +372,36 @@ class AggregateService:
                     frappe.ValidationError,
                 )
 
+    # Public aliases for reuse by other aggregation executors (child-table
+    # aggregation). They delegate to the private implementations above and below
+    # without changing behavior, so existing callers and tests are unaffected.
+    @classmethod
+    def normalize_aggregations(
+        cls,
+        aggregations: Any,
+        maximum: int,
+    ) -> list[dict[str, str]]:
+        """Validate aggregation entries and assign ``result_field`` and ``count_basis``."""
+        return cls._normalize_aggregations(aggregations, maximum)
+
+    @classmethod
+    def validate_aggregation_types(
+        cls,
+        meta: Any,
+        aggregations: list[Mapping[str, str]],
+    ) -> None:
+        """Require live fields, and numeric fields for sum and avg."""
+        cls._validate_aggregation_types(meta, aggregations)
+
+    @classmethod
+    def build_select_fields(
+        cls,
+        aggregations: list[Mapping[str, str]],
+        group_by: list[str],
+    ) -> list[str]:
+        """Return the ``get_list`` field expressions for the group-by and aggregates."""
+        return cls._build_query_fields(aggregations, group_by)
+
     @staticmethod
     def calculate_complexity(
         aggregations: list[Mapping[str, Any]],
