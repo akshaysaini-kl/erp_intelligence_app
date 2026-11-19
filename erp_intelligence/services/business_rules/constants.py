@@ -1,0 +1,64 @@
+"""Shared constants of the Business Rules Engine."""
+
+# Evaluator result statuses.
+PASS = "PASS"
+FAIL = "FAIL"
+WARNING = "WARNING"
+NEEDS_INPUT = "NEEDS_INPUT"
+NEEDS_CONFIRMATION = "NEEDS_CONFIRMATION"
+ERROR = "ERROR"
+
+RESULT_STATUSES = (PASS, FAIL, WARNING, NEEDS_INPUT, NEEDS_CONFIRMATION, ERROR)
+
+# Execution stages. The values match the Business Rule "Execution Stage" options.
+PRE_EXECUTION = "PRE_EXECUTION"
+PRE_COMMIT = "PRE_COMMIT"
+POST_EXECUTION = "POST_EXECUTION"
+
+EXECUTION_STAGES = (PRE_EXECUTION, PRE_COMMIT, POST_EXECUTION)
+
+# Severities. The values match the Business Rule "Default Severity" options.
+SEVERITY_INFO = "INFO"
+SEVERITY_WARNING = "WARNING"
+SEVERITY_CRITICAL = "CRITICAL"
+
+SEVERITIES = (SEVERITY_INFO, SEVERITY_WARNING, SEVERITY_CRITICAL)
+
+# Report decisions.
+DECISION_PROCEED = "PROCEED"
+DECISION_PROCEED_WITH_WARNINGS = "PROCEED_WITH_WARNINGS"
+DECISION_NEEDS_CONFIRMATION = "NEEDS_CONFIRMATION"
+DECISION_NEEDS_INPUT = "NEEDS_INPUT"
+DECISION_BLOCKED = "BLOCKED"
+DECISION_ERROR = "ERROR"
+
+PROCEEDING_DECISIONS = frozenset({DECISION_PROCEED, DECISION_PROCEED_WITH_WARNINGS})
+
+# Report-level error codes (the rule set or an assignment could not be used).
+ERROR_RULE_SET_NOT_FOUND = "RULE_SET_NOT_FOUND"
+ERROR_RULE_SET_DISABLED = "RULE_SET_DISABLED"
+ERROR_RULE_SET_AMBIGUOUS = "RULE_SET_AMBIGUOUS"
+ERROR_RULE_SET_EMPTY = "RULE_SET_EMPTY"
+ERROR_INVALID_REQUEST = "INVALID_REQUEST"
+
+# Evaluator error types carried in the details of an ERROR result.
+ERROR_TYPE_UNREGISTERED_EVALUATOR = "unregistered_evaluator"
+ERROR_TYPE_CONFIGURATION = "invalid_configuration"
+ERROR_TYPE_DATA_ACCESS = "data_access"
+ERROR_TYPE_CONTRACT = "contract_violation"
+ERROR_TYPE_EXCEPTION = "evaluator_exception"
+
+RESULT_FIELDS = (
+    "rule_code",
+    "status",
+    "severity",
+    "is_blocking",
+    "message",
+    "details",
+    "required_inputs",
+    "requires_confirmation",
+)
+
+REPORT_RESULT_TYPE = "business_rules_evaluation"
+
+LOGGER_NAME = "erp_intelligence.business_rules"
