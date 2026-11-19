@@ -21,6 +21,7 @@ from erp_intelligence.services.business_rules.errors import (
     EvaluatorRegistrationError,
     RuleConfigurationError,
     RuleDataError,
+    describe_exception,
 )
 from erp_intelligence.services.business_rules.parameters import (
     deep_merge,
@@ -62,6 +63,7 @@ def _registry() -> EvaluatorRegistry:
     registry.register("test.error_result", lambda ctx: ctx.result(c.ERROR, "evaluator reports an error"))
     registry.register("test.raises", _raise_runtime)
     registry.register("test.data_error", _raise_data_error)
+    registry.register("test.config_error", _raise_config_error)
     registry.register("test.bad_contract", lambda ctx: {"status": "PASS"})
     registry.register(
         "test.confirm_without_flag",
@@ -80,6 +82,10 @@ def _raise_runtime(context):
 
 def _raise_data_error(context):
     raise RuleDataError("cannot read", code="permission_denied")
+
+
+def _raise_config_error(context):
+    raise RuleConfigurationError("parameter x is not configured")
 
 
 def _make_rule(code, key="test.pass", *, stage=c.PRE_EXECUTION, blocking=1, enabled=1,
@@ -592,10 +598,12 @@ class TestDecisions(EngineCase):
         self.assertEqual(report["blocking_failures"], ["TEST_R1"])
         self.assertEqual(report["blocking_errors"], ["TEST_R3"])
 
-    def test_non_blocking_error_is_reported_without_blocking(self):
+    def test_non_blocking_error_stops_the_run(self):
+        """An evaluator failure is never a non-blocking issue. See TestStrictEvaluatorErrors."""
         report = self.decision_for(("test.pass", 1), ("test.raises", 0))
-        self.assertTrue(report["can_proceed"])
-        self.assertEqual(report["non_blocking_issues"], [{"rule_code": "TEST_R2", "status": c.ERROR}])
+        self.assertEqual(report["decision"], c.DECISION_ERROR)
+        self.assertFalse(report["can_proceed"])
+        self.assertEqual(report["non_blocking_issues"], [])
 
     def test_pending_input_outranks_pending_confirmation(self):
         report = self.decision_for(("test.needs_confirmation", 1), ("test.needs_input", 1))
@@ -605,6 +613,351 @@ class TestDecisions(EngineCase):
     def test_one_failing_rule_does_not_stop_the_others(self):
         report = self.decision_for(("test.raises", 1), ("test.pass", 1), ("test.fail", 1))
         self.assertEqual([item["status"] for item in report["results"]], [c.ERROR, c.PASS, c.FAIL])
+
+
+# ------------------------------------------------------- strict evaluator errors
+class TestStrictEvaluatorErrors(EngineCase):
+    """Any ERROR result stops the run, whatever the rule's blocking flag or severity."""
+
+    ERROR_CASES = {
+        "test.not_registered": c.ERROR_TYPE_UNREGISTERED_EVALUATOR,
+        "test.config_error": c.ERROR_TYPE_CONFIGURATION,
+        "test.data_error": c.ERROR_TYPE_DATA_ACCESS,
+        "test.bad_contract": c.ERROR_TYPE_CONTRACT,
+        "test.raises": c.ERROR_TYPE_EXCEPTION,
+        "test.error_result": c.ERROR_TYPE_EXCEPTION,  # an evaluator that returns ERROR itself
+    }
+
+    def run_rules(self, *specs, stage=c.PRE_EXECUTION):
+        """specs: (evaluator key, blocking[, severity]). Rule codes are TEST_R1, TEST_R2, ..."""
+        for index, (key, blocking, *rest) in enumerate(specs, start=1):
+            _make_rule(
+                f"TEST_R{index}", key, blocking=blocking, stage=stage,
+                severity=rest[0] if rest else c.SEVERITY_CRITICAL,
+            )
+        _make_set([(f"TEST_R{index}", index * 10) for index in range(1, len(specs) + 1)])
+        return self.evaluate(stage=stage)
+
+    def test_every_error_type_stops_a_non_blocking_rule(self):
+        for key, error_type in self.ERROR_CASES.items():
+            for severity in c.SEVERITIES:
+                with self.subTest(key=key, severity=severity):
+                    frappe.db.rollback()
+                    report = self.run_rules(("test.pass", 1), (key, 0, severity))
+                    self.assertEqual(report["decision"], c.DECISION_ERROR)
+                    self.assertIs(report["can_proceed"], False)
+                    self.assertEqual(
+                        report["evaluation_errors"],
+                        [{"rule_code": "TEST_R2", "error_type": error_type, "rule_is_blocking": False}],
+                    )
+                    self.assertEqual(report["blocking_errors"], ["TEST_R2"])
+                    self.assertEqual(report["non_blocking_issues"], [])
+                    self.assertEqual(report["warnings"], [])
+                    self.assertEqual(report["summary"]["evaluation_errors"], 1)
+                    self.assertEqual(self.result_of(report, "TEST_R2")["status"], c.ERROR)
+                    self.assertIs(report["execution_performed"], False)
+
+    def test_error_types_are_the_documented_vocabulary(self):
+        self.assertEqual(
+            set(c.ERROR_TYPES),
+            {"unregistered_evaluator", "invalid_configuration", "data_access", "contract_violation",
+             "evaluator_exception"},
+        )
+        self.assertEqual(set(self.ERROR_CASES.values()), set(c.ERROR_TYPES))
+
+    def test_blocking_rules_report_the_same_entry_with_the_flag_set(self):
+        report = self.run_rules(("test.raises", 1))
+        self.assertEqual(
+            report["evaluation_errors"],
+            [{"rule_code": "TEST_R1", "error_type": c.ERROR_TYPE_EXCEPTION, "rule_is_blocking": True}],
+        )
+        self.assertEqual(report["decision"], c.DECISION_ERROR)
+
+    def test_a_non_blocking_business_outcome_still_does_not_block(self):
+        for key in ("test.fail", "test.warning", "test.needs_input", "test.needs_confirmation"):
+            with self.subTest(key):
+                frappe.db.rollback()
+                report = self.run_rules(("test.pass", 1), (key, 0))
+                self.assertTrue(report["can_proceed"])
+                self.assertEqual(report["decision"], c.DECISION_PROCEED_WITH_WARNINGS)
+                self.assertEqual(report["evaluation_errors"], [])
+                self.assertEqual(report["blocking_errors"], [])
+
+    def test_a_business_failure_and_an_evaluator_error_stay_separate(self):
+        report = self.run_rules(("test.fail", 0), ("test.raises", 0), ("test.warning", 1), ("test.fail", 1))
+        self.assertEqual(report["decision"], c.DECISION_ERROR)
+        self.assertEqual([item["rule_code"] for item in report["evaluation_errors"]], ["TEST_R2"])
+        self.assertEqual(report["non_blocking_issues"], [{"rule_code": "TEST_R1", "status": c.FAIL}])
+        self.assertEqual(report["warnings"], ["TEST_R3"])
+        self.assertEqual(report["blocking_failures"], ["TEST_R4"])
+
+    def test_several_errors_are_all_listed_in_rule_order(self):
+        report = self.run_rules(("test.data_error", 0), ("test.pass", 1), ("test.bad_contract", 1))
+        self.assertEqual(
+            [(e["rule_code"], e["error_type"]) for e in report["evaluation_errors"]],
+            [("TEST_R1", c.ERROR_TYPE_DATA_ACCESS), ("TEST_R3", c.ERROR_TYPE_CONTRACT)],
+        )
+        self.assertEqual(report["blocking_errors"], ["TEST_R1", "TEST_R3"])
+
+    def test_a_clean_report_has_no_evaluation_errors(self):
+        report = self.run_rules(("test.pass", 1), ("test.warning", 0))
+        self.assertEqual(report["evaluation_errors"], [])
+        self.assertEqual(report["summary"]["evaluation_errors"], 0)
+
+    def test_reports_without_rules_carry_the_field(self):
+        report = self.evaluate()  # no rule set exists
+        self.assertEqual(report["decision"], c.DECISION_ERROR)
+        self.assertEqual(report["evaluation_errors"], [])
+
+    def test_an_assignment_to_a_missing_rule_is_a_configuration_error(self):
+        _make_rule("TEST_RULE")
+        _make_set([("TEST_RULE", 10)])
+        # Simulate the rule being missing when the engine loads it.
+        with mock.patch.object(BusinessRulesEngine, "_load_rules", return_value={}):
+            report = self.evaluate()
+        self.assertEqual(report["decision"], c.DECISION_ERROR)
+        self.assertEqual(report["evaluation_errors"][0]["error_type"], c.ERROR_TYPE_CONFIGURATION)
+        self.assertTrue(report["evaluation_errors"][0]["rule_is_blocking"])
+
+    # ---------------------------------------------------------- POST_EXECUTION
+    def test_post_execution_verification_states(self):
+        cases = {
+            "test.pass": (c.DECISION_PROCEED, c.VERIFICATION_VERIFIED),
+            "test.warning": (c.DECISION_PROCEED_WITH_WARNINGS, c.VERIFICATION_VERIFIED),
+            "test.fail": (c.DECISION_BLOCKED, c.VERIFICATION_FAILED),
+            "test.raises": (c.DECISION_ERROR, c.VERIFICATION_UNVERIFIED),
+            "test.data_error": (c.DECISION_ERROR, c.VERIFICATION_UNVERIFIED),
+            "test.needs_input": (c.DECISION_NEEDS_INPUT, c.VERIFICATION_UNVERIFIED),
+            "test.needs_confirmation": (c.DECISION_NEEDS_CONFIRMATION, c.VERIFICATION_UNVERIFIED),
+        }
+        for key, (decision, verification) in cases.items():
+            with self.subTest(key):
+                frappe.db.rollback()
+                report = self.run_rules((key, 1), stage=c.POST_EXECUTION)
+                self.assertEqual(report["decision"], decision)
+                self.assertEqual(report["outcome_verification"]["status"], verification)
+                self.assertTrue(report["outcome_verification"]["message"])
+
+    def test_a_non_blocking_error_makes_the_outcome_unverified(self):
+        report = self.run_rules(("test.pass", 1), ("test.raises", 0), stage=c.POST_EXECUTION)
+        self.assertEqual(report["outcome_verification"]["status"], c.VERIFICATION_UNVERIFIED)
+        self.assertIn("unverified", report["message"])
+        self.assertFalse(report["can_proceed"])
+
+    def test_post_execution_without_a_usable_rule_set_is_unverified(self):
+        report = self.evaluate(stage=c.POST_EXECUTION)
+        self.assertEqual(report["error_code"], c.ERROR_RULE_SET_NOT_FOUND)
+        self.assertEqual(report["outcome_verification"]["status"], c.VERIFICATION_UNVERIFIED)
+
+    def test_other_stages_have_no_outcome_verification(self):
+        for stage in (c.PRE_EXECUTION, c.PRE_COMMIT):
+            with self.subTest(stage):
+                frappe.db.rollback()
+                report = self.run_rules(("test.raises", 0), stage=stage)
+                self.assertIsNone(report["outcome_verification"])
+                self.assertNotIn("unverified", report["message"])
+
+    def test_a_failed_post_execution_check_is_not_called_unverified(self):
+        report = self.run_rules(("test.fail", 1), stage=c.POST_EXECUTION)
+        self.assertEqual(report["outcome_verification"]["status"], c.VERIFICATION_FAILED)
+        self.assertNotIn("unverified", report["message"])
+
+
+# ------------------------------------------------------------- exception logging
+class TestExceptionDescription(unittest.TestCase):
+    def test_the_description_has_the_class_and_the_location_but_not_the_message(self):
+        def inner():
+            raise ValueError("document value SECRET-123")
+
+        def outer():
+            inner()
+
+        try:
+            outer()
+        except ValueError as exc:
+            text = describe_exception(exc)
+        self.assertNotIn("SECRET-123", text)
+        self.assertIn("ValueError", text)
+        self.assertIn("inner", text)
+        self.assertIn("test_business_rules_engine.py", text)
+        self.assertNotIn("/", text)
+
+    def test_an_exception_that_was_never_raised_has_no_location(self):
+        self.assertEqual(describe_exception(KeyError("SECRET-123")), "KeyError")
+
+    def test_the_description_is_bounded(self):
+        def recurse(depth):
+            if depth:
+                recurse(depth - 1)
+            else:
+                raise RuntimeError("x")
+
+        try:
+            recurse(50)
+        except RuntimeError as exc:
+            self.assertLess(len(describe_exception(exc)), 600)
+
+
+# ------------------------------------------------------------------ empty stages
+class TestEmptyStage(EngineCase):
+    """A stage with no applicable rule is an ERROR, never a PROCEED."""
+
+    STAGE_RULE = {c.PRE_EXECUTION: "TEST_PRE", c.PRE_COMMIT: "TEST_COMMIT", c.POST_EXECUTION: "TEST_POST"}
+
+    def make_set_without(self, empty_stage, evaluator="test.pass"):
+        """A rule set with one rule at each stage except ``empty_stage``."""
+        assignments = []
+        for index, (stage, code) in enumerate(self.STAGE_RULE.items(), start=1):
+            if stage == empty_stage:
+                continue
+            _make_rule(code, evaluator, stage=stage)
+            assignments.append((code, index * 10))
+        return _make_set(assignments)
+
+    def assertNoRulesForStage(self, report, stage):
+        self.assertEqual(report["decision"], c.DECISION_ERROR)
+        self.assertIs(report["can_proceed"], False)
+        self.assertEqual(report["error_code"], c.ERROR_NO_RULES_FOR_STAGE)
+        self.assertEqual(report["error_code"], "NO_RULES_FOR_STAGE")
+        self.assertEqual(report["stage"], stage)
+        self.assertEqual(report["results"], [])
+        self.assertEqual(report["evaluation_errors"], [])
+        self.assertEqual(report["summary"]["rules_evaluated"], 0)
+        self.assertFalse(report["summary"]["all_passed"])
+        self.assertIsNone(report["confirmation_binding"])
+        self.assertIs(report["execution_performed"], False)
+        self.assertIn("No business rules were evaluated", report["message"])
+        self.assertIn(f"stage {stage}", report["message"])
+        self.assertIn("not a pass", report["message"])
+        self.assertIn("not permission to proceed", report["message"])
+        self.assertEqual(report["rule_set"]["name"], "TEST BRE Set")
+        self.assertEqual(report["rule_set"]["version"], "1")
+
+    def test_an_empty_stage_is_an_error_at_every_stage(self):
+        for stage in c.EXECUTION_STAGES:
+            with self.subTest(stage):
+                frappe.db.rollback()
+                self.make_set_without(stage)
+                report = self.evaluate(stage)
+                self.assertNoRulesForStage(report, stage)
+                others = [other for other in c.EXECUTION_STAGES if other != stage]
+                for other in others:
+                    self.assertIn(other, report["message"])
+                self.assertEqual(
+                    {item["rule_code"]: item["execution_stage"] for item in report["skipped"]},
+                    {self.STAGE_RULE[other]: other for other in others},
+                )
+                self.assertEqual({item["reason"] for item in report["skipped"]}, {"other_stage"})
+                self.assertEqual(report["summary"]["rules_skipped"], 2)
+
+    def test_post_execution_with_no_rules_is_unverified(self):
+        self.make_set_without(c.POST_EXECUTION)
+        report = self.evaluate(c.POST_EXECUTION)
+        self.assertEqual(report["outcome_verification"]["status"], c.VERIFICATION_UNVERIFIED)
+        self.assertIn("unverified", report["outcome_verification"]["message"])
+        for stage in (c.PRE_EXECUTION, c.PRE_COMMIT):
+            frappe.db.rollback()
+            self.make_set_without(stage)
+            self.assertIsNone(self.evaluate(stage)["outcome_verification"])
+
+    def test_a_set_with_rules_at_one_stage_only(self):
+        _make_rule("TEST_ONLY", stage=c.PRE_COMMIT)
+        _make_set([("TEST_ONLY", 10)])
+        for stage in (c.PRE_EXECUTION, c.POST_EXECUTION):
+            with self.subTest(stage):
+                self.assertNoRulesForStage(self.evaluate(stage), stage)
+        ok = self.evaluate(c.PRE_COMMIT)
+        self.assertEqual(ok["decision"], c.DECISION_PROCEED)
+        self.assertTrue(ok["can_proceed"])
+
+    def test_disabled_rules_and_assignments_do_not_count_as_applicable(self):
+        _make_rule("TEST_OFF_RULE", enabled=0)
+        _make_rule("TEST_OFF_ASSIGNMENT")
+        _make_rule("TEST_OTHER_STAGE", stage=c.PRE_COMMIT)
+        doc = _make_set([("TEST_OFF_RULE", 10), ("TEST_OFF_ASSIGNMENT", 20), ("TEST_OTHER_STAGE", 30)])
+        frappe.db.set_value("Business Rule Assignment", doc.rules[1].name, "enabled", 0)
+        report = self.evaluate(c.PRE_EXECUTION)
+        self.assertNoRulesForStage(report, c.PRE_EXECUTION)
+        self.assertEqual(
+            {item["rule_code"]: item["reason"] for item in report["skipped"]},
+            {"TEST_OFF_RULE": "rule_disabled", "TEST_OFF_ASSIGNMENT": "assignment_disabled",
+             "TEST_OTHER_STAGE": "other_stage"},
+        )
+        self.assertIn(c.PRE_COMMIT, report["message"])
+
+    def test_the_message_says_so_when_no_stage_has_an_enabled_rule(self):
+        _make_rule("TEST_OFF_RULE", enabled=0)
+        _make_rule("TEST_ON")
+        _make_set([("TEST_OFF_RULE", 10), ("TEST_ON", 20)])
+        report = self.evaluate(c.PRE_COMMIT)  # TEST_ON runs at PRE_EXECUTION only
+        self.assertNoRulesForStage(report, c.PRE_COMMIT)
+        self.assertIn(c.PRE_EXECUTION, report["message"])
+        frappe.db.rollback()
+        _make_rule("TEST_OFF_RULE", enabled=0)
+        _make_set([("TEST_OFF_RULE", 10)])
+        report = self.evaluate(c.PRE_EXECUTION)
+        self.assertNoRulesForStage(report, c.PRE_EXECUTION)
+        self.assertIn("None of its enabled assignments is an enabled rule", report["message"])
+
+    def test_the_codes_stay_distinct(self):
+        self.assertEqual(self.evaluate()["error_code"], c.ERROR_RULE_SET_NOT_FOUND)  # no set at all
+        _make_rule("TEST_RULE")
+        _make_set([("TEST_RULE", 10)], name="TEST BRE Off", enabled=0)
+        self.assertEqual(self.evaluate()["error_code"], c.ERROR_RULE_SET_DISABLED)
+        frappe.db.rollback()
+        _make_rule("TEST_RULE")
+        doc = _make_set([("TEST_RULE", 10)])
+        frappe.db.set_value("Business Rule Assignment", doc.rules[0].name, "enabled", 0)
+        self.assertEqual(self.evaluate()["error_code"], c.ERROR_RULE_SET_EMPTY)  # no enabled assignment at all
+        frappe.db.rollback()
+        _make_rule("TEST_RULE")
+        _make_set([("TEST_RULE", 10)])
+        self.assertEqual(self.evaluate(c.PRE_COMMIT)["error_code"], c.ERROR_NO_RULES_FOR_STAGE)
+        codes = {c.ERROR_RULE_SET_NOT_FOUND, c.ERROR_RULE_SET_DISABLED, c.ERROR_RULE_SET_EMPTY,
+                 c.ERROR_NO_RULES_FOR_STAGE, c.ERROR_RULE_SET_AMBIGUOUS}
+        self.assertEqual(len(codes), 5)
+
+    def test_supplied_confirmations_and_inputs_cannot_turn_an_empty_stage_into_a_pass(self):
+        self.make_set_without(c.PRE_COMMIT, evaluator="test.needs_confirmation")
+        report = self.evaluate(c.PRE_COMMIT, confirmations=["k1"], require_confirmation_binding=True)
+        self.assertNoRulesForStage(report, c.PRE_COMMIT)
+        report = self.evaluate(c.PRE_COMMIT, payload={"anything": 1}, execution_options={"submit": True})
+        self.assertNoRulesForStage(report, c.PRE_COMMIT)
+
+    def test_an_assignment_to_a_missing_rule_is_still_an_evaluated_error(self):
+        _make_rule("TEST_RULE")
+        _make_set([("TEST_RULE", 10)])
+        with mock.patch.object(BusinessRulesEngine, "_load_rules", return_value={}):
+            report = self.evaluate()
+        self.assertEqual(report["decision"], c.DECISION_ERROR)
+        self.assertIsNone(report["error_code"])  # a rule was evaluated and failed, so not an empty stage
+        self.assertEqual(len(report["results"]), 1)
+
+    def test_stages_that_have_rules_are_unchanged(self):
+        _make_rule("TEST_PRE")
+        _make_rule("TEST_COMMIT", "test.warning", stage=c.PRE_COMMIT)
+        _make_rule("TEST_POST", "test.fail", stage=c.POST_EXECUTION)
+        _make_set([("TEST_PRE", 10), ("TEST_COMMIT", 20), ("TEST_POST", 30)])
+        expected = {
+            c.PRE_EXECUTION: (c.DECISION_PROCEED, True, "TEST_PRE", None),
+            c.PRE_COMMIT: (c.DECISION_PROCEED_WITH_WARNINGS, True, "TEST_COMMIT", None),
+            c.POST_EXECUTION: (c.DECISION_BLOCKED, False, "TEST_POST", c.VERIFICATION_FAILED),
+        }
+        for stage, (decision, can_proceed, code, verification) in expected.items():
+            with self.subTest(stage):
+                report = self.evaluate(stage)
+                self.assertEqual(report["decision"], decision)
+                self.assertIs(report["can_proceed"], can_proceed)
+                self.assertIsNone(report["error_code"])
+                self.assertEqual([item["rule_code"] for item in report["results"]], [code])
+                self.assertEqual(report["summary"]["rules_evaluated"], 1)
+                self.assertEqual(report["summary"]["rules_skipped"], 2)
+                self.assertEqual(report["notes"], [])
+                if verification is None:
+                    self.assertIsNone(report["outcome_verification"])
+                else:
+                    self.assertEqual(report["outcome_verification"]["status"], verification)
+                self.assertIsNotNone(report["confirmation_binding"])
 
 
 # --------------------------------------------------------------------- stages/skips
@@ -625,15 +978,6 @@ class TestStagesAndSkips(EngineCase):
         self.assertEqual(commit["decision"], c.DECISION_BLOCKED)
         post = self.evaluate(c.POST_EXECUTION)
         self.assertEqual([item["rule_code"] for item in post["results"]], ["TEST_POST"])
-
-    def test_stage_with_no_rules_evaluates_nothing_and_says_so(self):
-        _make_rule("TEST_PRE")
-        _make_set([("TEST_PRE", 10)])
-        report = self.evaluate(c.POST_EXECUTION)
-        self.assertEqual(report["results"], [])
-        self.assertEqual(report["summary"]["rules_evaluated"], 0)
-        self.assertFalse(report["summary"]["all_passed"])
-        self.assertTrue(report["notes"])
 
     def test_disabled_rule_and_disabled_assignment_are_skipped_and_reported(self):
         _make_rule("TEST_ON")

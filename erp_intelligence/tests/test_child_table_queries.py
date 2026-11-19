@@ -692,7 +692,7 @@ class TestToolSchemaAndRegistration(unittest.TestCase):
                 self.assertNotIn("parent_context", tool.inputSchema["properties"])
                 self.assertIs(tool.inputSchema["additionalProperties"], False)
 
-    def test_four_tools_are_still_registered_once(self):
+    def test_tools_are_registered_once(self):
         import erp_intelligence.hooks as hooks
 
         self.assertEqual(len(hooks.assistant_tools), len(set(hooks.assistant_tools)))
@@ -700,7 +700,17 @@ class TestToolSchemaAndRegistration(unittest.TestCase):
         for path in hooks.assistant_tools:
             module, cls = path.rsplit(".", 1)
             names.append(getattr(__import__(module, fromlist=[cls]), cls)().name)
-        self.assertEqual(sorted(names), ["aggregate_records", "describe_doctype", "intelligence_request", "query_records"])
+        # The four original tools plus evaluate_business_rules (disabled by default).
+        self.assertEqual(
+            sorted(names),
+            [
+                "aggregate_records",
+                "describe_doctype",
+                "evaluate_business_rules",
+                "intelligence_request",
+                "query_records",
+            ],
+        )
 
     def test_fac_argument_validation_accepts_and_rejects(self):
         good = {"doctype": CHILD, "parent_context": {"parent_doctype": PARENT, "parent_names": ["X"]}}

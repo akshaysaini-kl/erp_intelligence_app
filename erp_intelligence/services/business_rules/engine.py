@@ -21,6 +21,7 @@ from typing import Any
 import frappe
 from frappe.utils import nowdate
 
+from erp_intelligence.services.business_rules import binding as binding_module
 from erp_intelligence.services.business_rules import constants as c
 from erp_intelligence.services.business_rules.context import (
     EvaluationContext,
@@ -32,6 +33,7 @@ from erp_intelligence.services.business_rules.errors import (
     EvaluatorContractError,
     RuleConfigurationError,
     RuleDataError,
+    describe_exception,
 )
 from erp_intelligence.services.business_rules.parameters import resolve_parameters
 from erp_intelligence.services.business_rules.registry import (
@@ -53,6 +55,7 @@ _RULE_FIELDS = [
     "is_blocking",
     "enabled",
     "default_parameters",
+    "modified",
 ]
 _MAX_ERROR_TEXT = 500
 
@@ -69,6 +72,8 @@ class BusinessRulesEngine:
         *,
         stage: str,
         confirmations: Mapping[str, Any] | list[str] | None = None,
+        confirmation_binding: str | None = None,
+        require_confirmation_binding: bool = False,
         execution_options: Mapping[str, Any] | None = None,
         execution_result: Mapping[str, Any] | None = None,
         user: str | None = None,
@@ -80,7 +85,14 @@ class BusinessRulesEngine:
         ``payload`` is the proposed document data (for a create, the data the
         caller intends to send). ``confirmations`` lists the confirmation keys the
         user has explicitly given; a mapping counts only keys whose value is
-        ``True``. ``execution_options`` carries the caller's intended execution
+        ``True``. Every report carries ``confirmation_binding.fingerprint``, a keyed
+        fingerprint of the whole request (see ``binding.py``). With
+        ``require_confirmation_binding`` (the assistant tool always sets it)
+        confirmations are honored only when ``confirmation_binding`` equals the
+        fingerprint of this request; otherwise all of them are discarded and the
+        report says why. Without it, confirmations are honored as before, unless a
+        ``confirmation_binding`` is supplied, in which case it must match too.
+        ``execution_options`` carries the caller's intended execution
         flags (for example ``{"submit": False}``). ``execution_result`` carries the
         outcome of the execution for POST_EXECUTION rules (for example the created
         document name). ``user`` may only assert the current session user.
@@ -107,7 +119,6 @@ class BusinessRulesEngine:
 
         registry = registry or get_default_registry()
         data_access = data_access or RuleDataAccess(user=user)
-        confirmed = normalize_confirmations(confirmations)
         today = nowdate()
 
         assignments = cls._ordered_assignments(rule_set)
@@ -123,30 +134,20 @@ class BusinessRulesEngine:
 
         rules = cls._load_rules([row.business_rule for row in assignments if row.enabled])
 
-        results: list[dict[str, Any]] = []
+        # Decide which assignments run before running any of them: the confirmation
+        # binding covers exactly the rules that are evaluated.
         skipped: list[dict[str, Any]] = []
+        planned: list[tuple[Any, Mapping[str, Any] | None]] = []
         for row in assignments:
             code = row.business_rule
             if not row.enabled:
                 skipped.append({"rule_code": code, "reason": "assignment_disabled"})
                 continue
             rule_row = rules.get(code)
-            if rule_row is None:
-                results.append(
-                    cls._engine_error(
-                        code,
-                        c.SEVERITY_CRITICAL,
-                        True,
-                        c.ERROR_TYPE_CONFIGURATION,
-                        f"Business Rule {code} assigned to {rule_set.name} does not exist.",
-                        row.sequence,
-                    )
-                )
-                continue
-            if not rule_row["enabled"]:
+            if rule_row is not None and not rule_row["enabled"]:
                 skipped.append({"rule_code": code, "reason": "rule_disabled"})
                 continue
-            if rule_row["execution_stage"] != stage:
+            if rule_row is not None and rule_row["execution_stage"] != stage:
                 skipped.append(
                     {
                         "rule_code": code,
@@ -155,7 +156,41 @@ class BusinessRulesEngine:
                     }
                 )
                 continue
+            planned.append((row, rule_row))
 
+        if not planned:
+            # A stage with no applicable rule has nothing to say about the operation.
+            # Reporting PROCEED would let a caller read "unchecked" as "allowed".
+            return cls._report_without_rules(
+                target_doctype,
+                operation,
+                stage,
+                c.ERROR_NO_RULES_FOR_STAGE,
+                cls._no_rules_message(rule_set, stage, skipped),
+                rule_set=rule_set,
+                skipped=skipped,
+            )
+
+        confirmed, binding = cls._confirmation_binding(
+            target_doctype, operation, stage, rule_set, planned, payload,
+            execution_options, execution_result, confirmations,
+            confirmation_binding, require_confirmation_binding,
+        )
+
+        results: list[dict[str, Any]] = []
+        for row, rule_row in planned:
+            if rule_row is None:
+                results.append(
+                    cls._engine_error(
+                        row.business_rule,
+                        c.SEVERITY_CRITICAL,
+                        True,
+                        c.ERROR_TYPE_CONFIGURATION,
+                        f"Business Rule {row.business_rule} assigned to {rule_set.name} does not exist.",
+                        row.sequence,
+                    )
+                )
+                continue
             results.append(
                 cls._run_rule(
                     row,
@@ -175,8 +210,74 @@ class BusinessRulesEngine:
             )
 
         return cls._build_report(
-            target_doctype, operation, stage, rule_set, results, skipped, data_access
+            target_doctype, operation, stage, rule_set, results, skipped, data_access, binding
         )
+
+    # --------------------------------------------------------------- confirmations
+    @classmethod
+    def _confirmation_binding(
+        cls,
+        target_doctype: str,
+        operation: str,
+        stage: str,
+        rule_set: Any,
+        planned: list[tuple[Any, Mapping[str, Any] | None]],
+        payload: Mapping[str, Any],
+        execution_options: Mapping[str, Any] | None,
+        execution_result: Mapping[str, Any] | None,
+        confirmations: Any,
+        supplied_binding: Any,
+        required: bool,
+    ) -> tuple[frozenset[str], dict[str, Any]]:
+        """Work out which supplied confirmations are honored, and describe the binding.
+
+        Returns the honored keys and the ``confirmation_binding`` report section.
+        """
+        supplied = normalize_confirmations(confirmations)
+        try:
+            context = binding_module.build_context(
+                user=frappe.session.user,
+                doctype=target_doctype.strip(),
+                operation=operation.strip(),
+                stage=stage,
+                rule_set={
+                    "name": rule_set.name,
+                    "version": rule_set.version,
+                    "modified": rule_set.modified,
+                },
+                rules=[
+                    {
+                        "rule_code": (rule_row["rule_code"] if rule_row else row.business_rule),
+                        "modified": (rule_row["modified"] if rule_row else None),
+                    }
+                    for row, rule_row in planned
+                ],
+                payload=payload,
+                execution_options=execution_options,
+                execution_result=execution_result,
+            )
+            fingerprint = binding_module.fingerprint(context)
+        except Exception:  # noqa: BLE001 - any failure means the binding is unavailable
+            fingerprint = None
+
+        # Callers that do not ask for binding keep the old behaviour, but a binding
+        # they do supply must match.
+        reason = None
+        if supplied and (required or supplied_binding is not None):
+            reason = binding_module.check(supplied_binding, fingerprint)
+        honored = supplied if reason is None else frozenset()
+        section = {
+            "version": binding_module.BINDING_VERSION,
+            "available": fingerprint is not None,
+            "fingerprint": fingerprint,
+            "covers": list(binding_module.COVERS),
+            "required": bool(required),
+            "confirmations_applied": sorted(honored),
+            "confirmations_rejected": (
+                {"keys": sorted(supplied), "reason": reason} if reason is not None else None
+            ),
+        }
+        return honored, section
 
     # ------------------------------------------------------------------ request
     @staticmethod
@@ -357,7 +458,10 @@ class BusinessRulesEngine:
                 {"data_error_code": exc.code},
             )
         except Exception as exc:  # noqa: BLE001 - an evaluator bug must not stop the run
-            frappe.logger(c.LOGGER_NAME).exception("Evaluator for rule %s raised", code)
+            # The message is left out of the log: it can contain document values.
+            frappe.logger(c.LOGGER_NAME).error(
+                "Evaluator for rule %s raised %s", code, describe_exception(exc)
+            )
             return cls._engine_error(
                 code, severity, is_blocking, c.ERROR_TYPE_EXCEPTION,
                 f"Rule {code} raised {type(exc).__name__}: {cls._clip(exc)}", sequence,
@@ -425,9 +529,11 @@ class BusinessRulesEngine:
         results: list[dict[str, Any]],
         skipped: list[dict[str, Any]],
         data_access: RuleDataAccess,
+        binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         blocking_failures: list[str] = []
         blocking_errors: list[str] = []
+        evaluation_errors: list[dict[str, Any]] = []
         pending_inputs: list[dict[str, Any]] = []
         pending_confirmations: list[dict[str, Any]] = []
         warnings: list[str] = []
@@ -440,6 +546,20 @@ class BusinessRulesEngine:
             counts[status] += 1
             if status == c.PASS:
                 continue
+            if status == c.ERROR:
+                # An evaluator failure is not a business outcome. The rule's
+                # is_blocking flag says what a FAIL means for the operation; it
+                # cannot say that an unevaluated rule may be ignored. Every ERROR
+                # stops the run, whatever the flag or severity.
+                blocking_errors.append(code)
+                evaluation_errors.append(
+                    {
+                        "rule_code": code,
+                        "error_type": cls._error_type(result),
+                        "rule_is_blocking": bool(result["is_blocking"]),
+                    }
+                )
+                continue
             if status == c.WARNING:
                 warnings.append(code)
                 continue
@@ -448,8 +568,6 @@ class BusinessRulesEngine:
                 continue
             if status == c.FAIL:
                 blocking_failures.append(code)
-            elif status == c.ERROR:
-                blocking_errors.append(code)
             elif status == c.NEEDS_INPUT:
                 pending_inputs.append(
                     {"rule_code": code, "required_inputs": result["required_inputs"]}
@@ -463,7 +581,7 @@ class BusinessRulesEngine:
                     }
                 )
 
-        if blocking_errors:
+        if evaluation_errors:
             decision = c.DECISION_ERROR
         elif blocking_failures:
             decision = c.DECISION_BLOCKED
@@ -477,8 +595,13 @@ class BusinessRulesEngine:
             decision = c.DECISION_PROCEED
 
         notes = []
-        if not results:
-            notes.append(f"No enabled rule is assigned to stage {stage}; nothing was evaluated.")
+        rejected = binding and binding["confirmations_rejected"]
+        if rejected:
+            notes.append(
+                "The supplied confirmations were not applied "
+                f"({rejected['reason']}). Ask the user again and pass the confirmation_binding "
+                "from this report together with the confirmations."
+            )
 
         return build_response(
             c.REPORT_RESULT_TYPE,
@@ -488,7 +611,8 @@ class BusinessRulesEngine:
                 "decision": decision,
                 "can_proceed": decision in c.PROCEEDING_DECISIONS,
                 "error_code": None,
-                "message": cls._decision_message(decision),
+                "message": cls._decision_message(decision, stage),
+                "outcome_verification": cls._outcome_verification(stage, decision),
                 "operation": operation,
                 "stage": stage,
                 "rule_set": {
@@ -496,6 +620,7 @@ class BusinessRulesEngine:
                     "version": rule_set.version,
                     "enabled": bool(rule_set.enabled),
                 },
+                "confirmation_binding": binding,
                 "results": results,
                 "skipped": skipped,
                 "summary": {
@@ -503,10 +628,12 @@ class BusinessRulesEngine:
                     "rules_skipped": len(skipped),
                     "status_counts": counts,
                     "all_passed": bool(results) and counts[c.PASS] == len(results),
+                    "evaluation_errors": len(evaluation_errors),
                     "data_requests": data_access.request_count,
                 },
                 "blocking_failures": blocking_failures,
                 "blocking_errors": blocking_errors,
+                "evaluation_errors": evaluation_errors,
                 "pending_inputs": pending_inputs,
                 "pending_confirmations": pending_confirmations,
                 "warnings": warnings,
@@ -519,6 +646,39 @@ class BusinessRulesEngine:
         )
 
     @classmethod
+    def error_report(
+        cls,
+        target_doctype: Any,
+        operation: Any,
+        stage: Any,
+        error_code: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """Return a fail-closed report for a request that could not be evaluated.
+
+        Public entry for callers (the assistant tool) that must refuse a request
+        before or after the engine runs, in exactly the shape of the engine's own
+        reports: ``decision`` ERROR, ``can_proceed`` false, no results and
+        ``execution_performed`` false. Echoed values are clipped, and a value that
+        is not a usable string is reported as ``None``, so this never raises on
+        hostile input.
+        """
+        return cls._report_without_rules(
+            cls._echo(target_doctype),
+            cls._echo(operation),
+            cls._echo(stage),
+            error_code,
+            message,
+        )
+
+    @staticmethod
+    def _echo(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text[:140] if text else None
+
+    @classmethod
     def _report_without_rules(
         cls,
         target_doctype: Any,
@@ -528,6 +688,7 @@ class BusinessRulesEngine:
         message: str,
         *,
         rule_set: Any = None,
+        skipped: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """A fail-closed report for a request that could not be evaluated at all."""
         return build_response(
@@ -539,6 +700,7 @@ class BusinessRulesEngine:
                 "can_proceed": False,
                 "error_code": error_code,
                 "message": message,
+                "outcome_verification": cls._outcome_verification(stage, c.DECISION_ERROR),
                 "operation": operation if isinstance(operation, str) else None,
                 "stage": stage if isinstance(stage, str) else None,
                 "rule_set": (
@@ -550,17 +712,20 @@ class BusinessRulesEngine:
                     if rule_set is not None
                     else None
                 ),
+                "confirmation_binding": None,
                 "results": [],
-                "skipped": [],
+                "skipped": list(skipped or []),
                 "summary": {
                     "rules_evaluated": 0,
-                    "rules_skipped": 0,
+                    "rules_skipped": len(skipped or []),
                     "status_counts": dict.fromkeys(c.RESULT_STATUSES, 0),
                     "all_passed": False,
+                    "evaluation_errors": 0,
                     "data_requests": 0,
                 },
                 "blocking_failures": [],
                 "blocking_errors": [],
+                "evaluation_errors": [],
                 "pending_inputs": [],
                 "pending_confirmations": [],
                 "warnings": [],
@@ -571,8 +736,65 @@ class BusinessRulesEngine:
         )
 
     @staticmethod
-    def _decision_message(decision: str) -> str:
-        return {
+    def _no_rules_message(rule_set: Any, stage: str, skipped: list[dict[str, Any]]) -> str:
+        """Explain that nothing was evaluated, and where rules do exist."""
+        stages = sorted(
+            {item["execution_stage"] for item in skipped if item.get("reason") == "other_stage"},
+            key=c.EXECUTION_STAGES.index,
+        )
+        where = (
+            f" It has enabled rules for stage {', '.join(stages)}."
+            if stages
+            else " None of its enabled assignments is an enabled rule."
+        )
+        return (
+            f"No business rules were evaluated for stage {stage}: Business Rule Set {rule_set.name} "
+            f"has no enabled rule for this stage.{where} This is not a pass and not permission to "
+            "proceed. Do not treat the operation as checked at this stage."
+        )
+
+    @staticmethod
+    def _error_type(result: Mapping[str, Any]) -> str:
+        """The evaluator failure class of an ERROR result.
+
+        The engine tags every failure it produces. An evaluator that returns the
+        ERROR status itself, without a recognised tag, is an evaluator failure of
+        its own making and is reported as ``evaluator_exception``.
+        """
+        details = result.get("details")
+        error_type = details.get("error_type") if isinstance(details, Mapping) else None
+        return error_type if error_type in c.ERROR_TYPES else c.ERROR_TYPE_EXCEPTION
+
+    @staticmethod
+    def _outcome_verification(stage: Any, decision: str) -> dict[str, str] | None:
+        """Say whether a POST_EXECUTION evaluation verified the outcome.
+
+        Other stages return None. VERIFIED means the checks ran and passed. FAILED
+        means the checks ran and found a problem with the outcome. UNVERIFIED means
+        the outcome could not be checked (an evaluation error, missing input, a
+        pending confirmation or no usable rule set), so the caller must not assume
+        the operation did or did not succeed as intended.
+        """
+        if stage != c.POST_EXECUTION:
+            return None
+        if decision in c.PROCEEDING_DECISIONS:
+            status, message = c.VERIFICATION_VERIFIED, "The outcome was checked and every rule passed."
+        elif decision == c.DECISION_BLOCKED:
+            status, message = (
+                c.VERIFICATION_FAILED,
+                "The outcome was checked and a rule failed. Report the failure to the user.",
+            )
+        else:
+            status, message = (
+                c.VERIFICATION_UNVERIFIED,
+                "The outcome could not be verified. Do not assume the operation succeeded or "
+                "failed. Tell the user it is unverified and check the document directly.",
+            )
+        return {"status": status, "message": message}
+
+    @staticmethod
+    def _decision_message(decision: str, stage: Any = None) -> str:
+        message = {
             c.DECISION_PROCEED: "All evaluated rules passed.",
             c.DECISION_PROCEED_WITH_WARNINGS: (
                 "No blocking issue. Review the warnings and non-blocking issues before proceeding."
@@ -585,6 +807,11 @@ class BusinessRulesEngine:
             ),
             c.DECISION_BLOCKED: "A blocking rule failed. Do not proceed.",
             c.DECISION_ERROR: (
-                "A blocking rule could not be evaluated. Do not proceed; the outcome is unknown."
+                "A rule could not be evaluated, or no usable rule set exists. Do not proceed; "
+                "the outcome is unknown."
             ),
         }[decision]
+        verification = BusinessRulesEngine._outcome_verification(stage, decision)
+        if verification and verification["status"] == c.VERIFICATION_UNVERIFIED:
+            message += " This is a POST_EXECUTION evaluation: the outcome is unverified."
+        return message

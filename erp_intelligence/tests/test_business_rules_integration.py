@@ -384,4 +384,6 @@ class TestSafetyOfTheImplementation(unittest.TestCase):
         hooks = (PACKAGE_ROOT.parent.parent / "hooks.py").read_text()
         for tool in ("DescribeDocType", "QueryRecords", "AggregateRecords", "IntelligenceRequest"):
             self.assertIn(tool, hooks)
-        self.assertNotIn("business_rule", hooks.lower())
+        # The engine itself is not a tool. Only the dedicated adapter is registered.
+        self.assertNotIn("services.business_rules", hooks)
+        self.assertIn("erp_intelligence.tools.evaluate_business_rules.EvaluateBusinessRules", hooks)

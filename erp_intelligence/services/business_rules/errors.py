@@ -6,6 +6,26 @@ not be evaluated, and the engine reports them as ERROR results.
 """
 
 
+import traceback
+
+_MAX_FRAMES = 6
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Describe an exception for a log line without its message.
+
+    Exception messages often contain the values that were being processed (a
+    document field, a name that was not found), so they must not reach the
+    application logs. This returns the exception class and the innermost frames
+    (file, line, function), which is enough to find the fault.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)[-_MAX_FRAMES:]
+    where = " <- ".join(
+        f"{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno} {frame.name}" for frame in reversed(frames)
+    )
+    return f"{type(exc).__name__} at {where}" if where else type(exc).__name__
+
+
 class BusinessRuleError(Exception):
     """Base class for engine errors."""
 
