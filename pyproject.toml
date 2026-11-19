@@ -7,7 +7,12 @@ description = "Metadata-aware ERP query and aggregation tools for Frappe"
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]
-dependencies = []
+dependencies = [
+    # setuptools 82+ no longer ships pkg_resources, which the Dropbox SDK pinned by
+    # older Frappe v15 releases still imports. Remove once the bench runs Frappe
+    # >= 15.100.0 (dropbox 12.x).
+    "setuptools>=71.0.0,<82.0.0",
+]
 
 [build-system]
 requires = ["flit_core >=3.4,<4"]
