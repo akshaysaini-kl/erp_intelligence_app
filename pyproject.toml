@@ -5,7 +5,6 @@ authors = [
 ]
 description = "Metadata-aware ERP query and aggregation tools for Frappe"
 requires-python = ">=3.10"
-readme = "README.md"
 dynamic = ["version"]
 dependencies = [
     # setuptools 82+ no longer ships pkg_resources, which the Dropbox SDK pinned by
