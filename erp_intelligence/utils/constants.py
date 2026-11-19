@@ -144,6 +144,34 @@ LIMIT_DEFINITIONS = MappingProxyType(
             1,
             250,
         ),
+        # Child-table aggregation. The defaults are PROVISIONAL: they have not been
+        # benchmarked yet and must be reviewed against measured results. The ceilings
+        # are safety bounds and do not move when a default is tuned. The number of
+        # rows a ranking may return reuses "returned_groups".
+        "child_agg_parent_scan": LimitDefinition(
+            "erp_intelligence_max_child_agg_parent_scan",
+            5_000,
+            1,
+            50_000,
+        ),
+        "child_agg_parent_batch": LimitDefinition(
+            "erp_intelligence_child_agg_parent_batch",
+            500,
+            1,
+            1_000,
+        ),
+        "child_agg_top_n": LimitDefinition(
+            "erp_intelligence_max_child_agg_top_n",
+            20,
+            1,
+            100,
+        ),
+        "child_agg_max_seconds": LimitDefinition(
+            "erp_intelligence_max_child_agg_seconds",
+            15,
+            1,
+            60,
+        ),
         # Business context
         "business_context_companies": LimitDefinition(
             "erp_intelligence_business_context_max_companies",
@@ -162,6 +190,9 @@ LIMIT_DEFINITIONS = MappingProxyType(
 
 # Limits enforced while planning and executing one query or aggregation request.
 # Business-context limits are excluded because they belong to a separate call.
+# Child-aggregation limits are excluded too (see CHILD_AGGREGATION_LIMIT_NAMES): every
+# request resolves and validates every name in this tuple, so a malformed setting for a
+# feature that most requests never use must not be able to break unrelated requests.
 QUERY_LIMIT_NAMES = (
     "page_length",
     "offset",
@@ -175,4 +206,17 @@ QUERY_LIMIT_NAMES = (
     "group_by_fields",
     "returned_groups",
     "aggregate_complexity",
+)
+
+# Limits that only child-table aggregation (a request carrying ``parent_scope``) uses.
+# Their definitions stay in LIMIT_DEFINITIONS, so they keep their defaults, minimums and
+# ceilings and are validated exactly like every other limit. They are resolved and
+# validated only when a child aggregation runs, through
+# ``ConfigService.get_child_aggregation_limit_snapshot``, which merges them into the
+# request snapshot.
+CHILD_AGGREGATION_LIMIT_NAMES = (
+    "child_agg_parent_scan",
+    "child_agg_parent_batch",
+    "child_agg_top_n",
+    "child_agg_max_seconds",
 )

@@ -96,18 +96,31 @@ class QueryValidator:
         *,
         user: str | None = None,
         limit_snapshot: Mapping[str, int] | None = None,
+        parent_names_required: bool = True,
     ) -> dict[str, Any]:
         """Validate a structured request and return a normalized query plan.
 
         ``limit_snapshot`` is the request-scoped snapshot from
         ``ConfigService.get_limit_snapshot``. When omitted, limits are resolved
         from site configuration for this call.
+
+        ``parent_names_required`` only affects child DocTypes. It defaults to True,
+        which keeps every existing caller unchanged: a child query must then name
+        its parents. When False, ``parent_names`` may be omitted (the plan then
+        carries ``parent_names: None``), for callers that scope the parents some
+        other way. ``parent_names`` that are supplied are always validated in
+        full, so an empty or malformed list is still rejected.
         """
         cls._validate_request_shape(request)
 
         metadata = MetadataService.get_doctype_metadata(request.get("doctype"))
         parent_doctype, parent_fieldname = cls._validate_parent_context(request, metadata)
-        parent_names = cls._validate_parent_names(request, metadata, limit_snapshot)
+        parent_names = cls._validate_parent_names(
+            request,
+            metadata,
+            limit_snapshot,
+            required=parent_names_required,
+        )
         policy = FieldPolicy.get_field_policy(
             metadata,
             user=user,
@@ -246,11 +259,15 @@ class QueryValidator:
         request: Mapping[str, Any],
         metadata: Mapping[str, Any],
         limit_snapshot: Mapping[str, int] | None,
+        *,
+        required: bool = True,
     ) -> list[str] | None:
         """Validate the explicit parent document names of a child-table query.
 
         The parent_names limit is only resolved for child DocTypes, so ordinary
-        queries never depend on it.
+        queries never depend on it. With ``required=False`` an absent
+        ``parent_names`` (None) is accepted for a child DocType and returned as
+        None. Anything that is present must still be a valid non-empty list.
         """
         value = request.get("parent_names")
         if not metadata.get("istable"):
@@ -259,6 +276,9 @@ class QueryValidator:
                     _("Parent context is only valid for child DocTypes"),
                     frappe.ValidationError,
                 )
+            return None
+
+        if value is None and not required:
             return None
 
         if not isinstance(value, list) or not value:

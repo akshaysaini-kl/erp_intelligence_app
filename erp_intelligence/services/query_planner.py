@@ -13,6 +13,7 @@ from erp_intelligence.services.metadata_service import MetadataService
 from erp_intelligence.services.query_validator import QueryValidator
 from erp_intelligence.utils.constants import (
     AGGREGATION_FIELD_TYPES_BY_OPERATION,
+    NUMERIC_AGGREGATION_FIELD_TYPES,
     SUPPORTED_AGGREGATION_OPERATIONS,
 )
 from erp_intelligence.utils.response_utils import build_response
@@ -32,10 +33,16 @@ class QueryPlanner:
             "aggregations",
             "group_by",
             "parent_context",
+            "parent_scope",
+            "ranking",
             "user",
         }
     )
     _PARENT_CONTEXT_KEYS = frozenset({"parent_doctype", "parent_names"})
+    # Child-table aggregation (an additive request form, independent of parent_context).
+    _PARENT_SCOPE_KEYS = frozenset({"parent_doctype", "parent_filters", "parent_names"})
+    _RANKING_KEYS = frozenset({"by", "direction", "top_n", "include_ties"})
+    _CHILD_AGGREGATION = "child_aggregation"
     _FILTER_KEYS = frozenset({"field", "operator", "value"})
     _SORT_KEYS = frozenset({"field", "direction"})
     _AGGREGATION_KEYS = frozenset({"operation", "field"})
@@ -65,11 +72,20 @@ class QueryPlanner:
         """
         cls._validate_request_mapping(request)
         authenticated_user = cls._get_authenticated_user(user, request.get("user"))
+        cls._reject_unsupported_child_aggregation_forms(request)
         plan_type = cls._get_plan_type(request)
         if limit_snapshot is None:
             limit_snapshot = ConfigService.get_limit_snapshot()
         limits = cls._get_limits(limit_snapshot)
         cls._validate_outer_structure(request, plan_type, limits)
+
+        if "parent_scope" in request:
+            return cls._plan_child_aggregation(
+                request,
+                authenticated_user,
+                limits,
+                limit_snapshot,
+            )
 
         if "parent_context" in request:
             if plan_type != "records":
@@ -399,6 +415,388 @@ class QueryPlanner:
                 frappe.ValidationError,
             )
         return child_doctype, fieldnames[0], resolution
+
+    # ------------------------------------------------------------------ child-table aggregation
+    @classmethod
+    def _reject_unsupported_child_aggregation_forms(cls, request: Mapping[str, Any]) -> None:
+        """Reject, before anything else is planned, every form that is not child aggregation.
+
+        Does nothing for a request without ``parent_scope`` or ``ranking``, so every
+        existing request is planned exactly as before. ``ranking`` only exists for
+        child aggregation, and ``parent_scope`` stands alone (never with ``parent_context``).
+        """
+        has_scope = "parent_scope" in request
+        if "ranking" in request and not has_scope:
+            frappe.throw(
+                _("ranking is only supported together with parent_scope"),
+                frappe.ValidationError,
+            )
+        if not has_scope:
+            return
+
+        if "parent_context" in request:
+            frappe.throw(
+                _("parent_scope cannot be combined with parent_context"),
+                frappe.ValidationError,
+            )
+        if "aggregations" not in request:
+            frappe.throw(
+                _("parent_scope is only supported for aggregation requests"),
+                frappe.ValidationError,
+            )
+        conflicting = cls._RECORD_ONLY_KEYS & set(request)
+        if conflicting:
+            frappe.throw(
+                _(
+                    "Child aggregation requests cannot contain record retrieval, sorting or "
+                    "pagination keys: {0}"
+                ).format(", ".join(sorted(conflicting))),
+                frappe.ValidationError,
+            )
+        if request.get("filters") not in (None, []):
+            frappe.throw(
+                _(
+                    "Child-row filters are not supported for child aggregation. Use "
+                    "parent_scope.parent_filters to scope the parent records."
+                ),
+                frappe.ValidationError,
+            )
+        if "group_by" not in request:
+            frappe.throw(
+                _("Child aggregation requires group_by to be the parent field"),
+                frappe.ValidationError,
+            )
+        if "ranking" not in request:
+            frappe.throw(_("parent_scope requires ranking"), frappe.ValidationError)
+
+    @classmethod
+    def _plan_child_aggregation(
+        cls,
+        request: Mapping[str, Any],
+        user: str,
+        limits: Mapping[str, int],
+        limit_snapshot: Mapping[str, int],
+    ) -> dict[str, Any]:
+        """Plan a ranking of parent documents by an aggregate of their child rows.
+
+        Produces the request ``ChildAggregateService`` executes. Nothing is read from
+        the database here except metadata and permissions. Every permission decision
+        is made by ``ContextService``, ``QueryValidator`` and ``FieldPolicy`` under the
+        parent context, so a Table field or a child field the user cannot read never
+        reaches a plan. ``parent_names`` and ``parent_filters`` can only narrow the
+        scope: they are carried as data and executed as filters on a permission-checked
+        parent query. They never grant access.
+        """
+        parent_reference, scope = cls._validate_parent_scope_shape(request["parent_scope"], limits)
+
+        # The child-aggregation limits are not in the base snapshot. They are added only
+        # now, so a malformed setting for them can only ever fail a child aggregation.
+        child_snapshot = ConfigService.get_child_aggregation_limit_snapshot(limit_snapshot)
+        ranking_limits = ConfigService.resolve_limits(
+            "child_agg_top_n",
+            "returned_groups",
+            "child_agg_parent_scan",
+            "child_agg_parent_batch",
+            "child_agg_max_seconds",
+            snapshot=child_snapshot,
+        )
+        ranking = cls._validate_ranking_shape(request["ranking"], ranking_limits)
+
+        parent_resolution = ContextService.resolve_doctype(parent_reference, user=user)
+        if parent_resolution.get("match_status") != "resolved":
+            issue = cls._resolution_issue(
+                "/parent_scope/parent_doctype",
+                parent_reference,
+                parent_resolution,
+            )
+            return cls._non_executable_response(
+                cls._CHILD_AGGREGATION, issues=[issue], resolutions=[]
+            )
+        parent_value = parent_resolution.get("resolved_value")
+        if not isinstance(parent_value, Mapping) or not isinstance(parent_value.get("name"), str):
+            frappe.throw(
+                _("Unable to establish canonical DocType context"),
+                frappe.PermissionError,
+            )
+        parent_doctype = parent_value["name"]
+        cls._validate_execution_target(parent_doctype)
+
+        # Raises unless the child is a Table of the parent, used by exactly one Table field.
+        child_doctype, parent_fieldname, child_resolution = cls._resolve_child_doctype(
+            request["doctype"],
+            parent_doctype,
+        )
+        resolutions = [
+            cls._resolution_record(
+                "/parent_scope/parent_doctype", parent_reference, parent_doctype, parent_resolution
+            ),
+            cls._resolution_record("/doctype", request["doctype"], child_doctype, child_resolution),
+        ]
+
+        parent = {"parent_doctype": parent_doctype, "parent_fieldname": parent_fieldname}
+        issues: list[dict[str, Any]] = []
+        child_cache: dict[str, dict[str, Any]] = {}
+        parent_cache: dict[str, dict[str, Any]] = {}
+
+        aggregations = []
+        for index, aggregation in enumerate(request["aggregations"]):
+            fieldname = cls._resolve_field_reference(
+                child_doctype,
+                aggregation["field"],
+                f"/aggregations/{index}/field",
+                user,
+                child_cache,
+                issues,
+                resolutions,
+                parent,
+            )
+            if fieldname is not None:
+                aggregations.append(
+                    {"operation": aggregation["operation"].lower(), "field": fieldname}
+                )
+        group_by = cls._resolve_field_list(
+            child_doctype,
+            request["group_by"],
+            "/group_by",
+            user,
+            child_cache,
+            issues,
+            resolutions,
+            parent,
+        )
+        parent_filters = []
+        for index, item in enumerate(scope["parent_filters"]):
+            fieldname = cls._resolve_field_reference(
+                parent_doctype,
+                item["field"],
+                f"/parent_scope/parent_filters/{index}/field",
+                user,
+                parent_cache,
+                issues,
+                resolutions,
+            )
+            if fieldname is not None:
+                parent_filters.append(
+                    {"field": fieldname, "operator": item["operator"], "value": item["value"]}
+                )
+        ranking_field = None
+        if ranking["by"] is not None:
+            ranking_field = cls._resolve_field_reference(
+                child_doctype,
+                ranking["by"]["field"],
+                "/ranking/by/field",
+                user,
+                child_cache,
+                issues,
+                resolutions,
+                parent,
+            )
+        if issues:
+            return cls._non_executable_response(
+                cls._CHILD_AGGREGATION,
+                issues=issues,
+                resolutions=resolutions,
+                doctype=child_doctype,
+            )
+
+        if group_by != ["parent"]:
+            frappe.throw(
+                _("Child aggregation must group by the parent field and nothing else"),
+                frappe.ValidationError,
+            )
+        cls._validate_aggregation_duplicates(aggregations, group_by)
+        cls._validate_aggregation_field_types(child_doctype, aggregations)
+        ranked = cls._select_ranking_aggregation(
+            child_doctype, aggregations, ranking, ranking_field
+        )
+
+        # Neither validation is skipped, and neither is replaced: this is the same
+        # QueryValidator and FieldPolicy path every other request takes, run for the
+        # child under the parent context and for the parent's own filters.
+        child_plan = QueryValidator.validate_query(
+            {
+                "doctype": child_doctype,
+                "fields": cls._unique_fields(["parent", *(a["field"] for a in aggregations)]),
+                "filters": [],
+                "sort": [],
+                "page_length": 1,
+                "offset": 0,
+                "parent_doctype": parent_doctype,
+                "parent_fieldname": parent_fieldname,
+                "parent_names": scope["parent_names"],
+            },
+            user=user,
+            limit_snapshot=child_snapshot,
+            parent_names_required=False,
+        )
+        parent_plan = QueryValidator.validate_query(
+            {
+                "doctype": parent_doctype,
+                "fields": ["name"],
+                "filters": parent_filters,
+                "sort": [],
+                "page_length": 1,
+                "offset": 0,
+            },
+            user=user,
+            limit_snapshot=child_snapshot,
+        )
+        complexity = AggregateService.enforce_complexity_limit(
+            aggregations,
+            ["parent"],
+            parent_plan["filters"],
+            limits["aggregate_complexity"],
+        )
+
+        plan = {
+            "doctype": child_plan["doctype"],
+            "parent_doctype": parent_plan["doctype"],
+            "parent_fieldname": child_plan["parent_fieldname"],
+            "parent_filters": parent_plan["filters"],
+            "parent_names": child_plan["parent_names"],
+            "aggregations": aggregations,
+            "group_by": ["parent"],
+            "ranking": {
+                "by": dict(ranked),
+                "direction": "desc",
+                "top_n": ranking["top_n"],
+                "include_ties": ranking["include_ties"],
+            },
+        }
+        return cls._ready_response(
+            cls._CHILD_AGGREGATION,
+            child_plan["doctype"],
+            plan,
+            resolutions,
+            planning_metadata={
+                "complexity": complexity,
+                "complexity_limit": limits["aggregate_complexity"],
+                "top_n_limit": min(ranking_limits["child_agg_top_n"], ranking_limits["returned_groups"]),
+                "result_cap": ranking_limits["returned_groups"],
+                "parent_scan_limit": ranking_limits["child_agg_parent_scan"],
+                "parent_batch_size": ranking_limits["child_agg_parent_batch"],
+                "time_budget_seconds": ranking_limits["child_agg_max_seconds"],
+            },
+        )
+
+    @classmethod
+    def _validate_parent_scope_shape(
+        cls,
+        value: Any,
+        limits: Mapping[str, int],
+    ) -> tuple[str, dict[str, Any]]:
+        if (
+            not isinstance(value, Mapping)
+            or "parent_doctype" not in value
+            or set(value) - cls._PARENT_SCOPE_KEYS
+        ):
+            frappe.throw(
+                _("parent_scope must contain parent_doctype and may contain only: {0}").format(
+                    ", ".join(sorted(cls._PARENT_SCOPE_KEYS))
+                ),
+                frappe.ValidationError,
+            )
+        reference = cls._require_reference(value["parent_doctype"], "parent_doctype")
+
+        filters = cls._require_list(value.get("parent_filters", []), "parent_filters")
+        if len(filters) > limits["filters"]:
+            cls._raise_limit("parent_filters", limits["filters"])
+        for item in filters:
+            cls._validate_mapping_keys(item, cls._FILTER_KEYS, "parent filter")
+            cls._require_reference(item["field"], "parent filter field")
+
+        names = value.get("parent_names")
+        if "parent_names" in value and (not isinstance(names, list) or not names):
+            frappe.throw(_("parent_names must be a non-empty list"), frappe.ValidationError)
+        return reference, {"parent_filters": filters, "parent_names": names}
+
+    @classmethod
+    def _validate_ranking_shape(
+        cls,
+        value: Any,
+        ranking_limits: Mapping[str, int],
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) - cls._RANKING_KEYS:
+            frappe.throw(
+                _("ranking may only contain: {0}").format(", ".join(sorted(cls._RANKING_KEYS))),
+                frappe.ValidationError,
+            )
+        direction = value.get("direction", "desc")
+        if not isinstance(direction, str) or direction.lower() != "desc":
+            frappe.throw(
+                _(
+                    "Only descending ranking is supported: parents without child rows "
+                    "produce no group, so an ascending ranking would be wrong"
+                ),
+                frappe.ValidationError,
+            )
+
+        # top_n must fit both the configured top-N limit and the result cap, which is
+        # the number of rows a tie-inclusive ranking may return. Their effective values
+        # are compared here, because the limit definitions alone cannot guarantee it.
+        maximum = min(ranking_limits["child_agg_top_n"], ranking_limits["returned_groups"])
+        top_n = value.get("top_n")
+        if isinstance(top_n, bool) or not isinstance(top_n, int) or not 1 <= top_n <= maximum:
+            frappe.throw(
+                _("ranking.top_n must be an integer between 1 and {0}").format(maximum),
+                frappe.ValidationError,
+            )
+        include_ties = value.get("include_ties", True)
+        if not isinstance(include_ties, bool):
+            frappe.throw(_("ranking.include_ties must be a boolean"), frappe.ValidationError)
+
+        by = value.get("by")
+        if by is not None:
+            cls._validate_mapping_keys(by, cls._AGGREGATION_KEYS, "ranking.by")
+            operation = by["operation"]
+            if not isinstance(operation, str) or operation.lower() not in SUPPORTED_AGGREGATION_OPERATIONS:
+                frappe.throw(_("Unsupported aggregation operation"), frappe.ValidationError)
+            cls._require_reference(by["field"], "ranking.by field")
+            by = {"operation": operation.lower(), "field": by["field"]}
+        return {"by": by, "direction": "desc", "top_n": top_n, "include_ties": include_ties}
+
+    @classmethod
+    def _select_ranking_aggregation(
+        cls,
+        child_doctype: str,
+        aggregations: list[dict[str, str]],
+        ranking: Mapping[str, Any],
+        ranking_field: str | None,
+    ) -> dict[str, str]:
+        """Return the aggregation to rank by, and require that it is numeric."""
+        if ranking["by"] is None:
+            if len(aggregations) != 1:
+                frappe.throw(
+                    _("ranking.by is required when there is more than one aggregation"),
+                    frappe.ValidationError,
+                )
+            chosen = aggregations[0]
+        else:
+            matches = [
+                item
+                for item in aggregations
+                if item["operation"] == ranking["by"]["operation"] and item["field"] == ranking_field
+            ]
+            if len(matches) != 1:
+                frappe.throw(
+                    _("ranking.by must match one of the aggregations"), frappe.ValidationError
+                )
+            chosen = matches[0]
+
+        if chosen["operation"] != "count":
+            fieldtype = next(
+                (
+                    field.get("fieldtype")
+                    for field in MetadataService.get_doctype_metadata(child_doctype)["fields"]
+                    if field.get("fieldname") == chosen["field"]
+                ),
+                None,
+            )
+            if fieldtype not in NUMERIC_AGGREGATION_FIELD_TYPES:
+                frappe.throw(
+                    _("Ranking requires a numeric aggregation"), frappe.ValidationError
+                )
+        return chosen
 
     @classmethod
     def _plan_aggregation(
