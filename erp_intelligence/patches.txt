@@ -2,3 +2,4 @@
 
 [post_model_sync]
 erp_intelligence.patches.seed_purchase_order_create_rule_set
+erp_intelligence.patches.reseed_purchase_order_create_rule_set
