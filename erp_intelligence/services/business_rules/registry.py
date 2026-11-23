@@ -87,9 +87,19 @@ def get_default_registry() -> EvaluatorRegistry:
     if _default_registry is None:
         # Imported here to avoid a circular import: evaluator modules use the
         # context and result helpers, which do not import the registry.
-        from erp_intelligence.services.business_rules.evaluators import purchase_order
+        from erp_intelligence.services.business_rules.evaluators import (
+            delivery_note,
+            pick_list,
+            purchase_order,
+            sales_invoice,
+            sales_order,
+        )
 
         registry = EvaluatorRegistry()
         purchase_order.register_all(registry)
+        sales_order.register_all(registry)
+        pick_list.register_all(registry)
+        delivery_note.register_all(registry)
+        sales_invoice.register_all(registry)
         _default_registry = registry
     return _default_registry
