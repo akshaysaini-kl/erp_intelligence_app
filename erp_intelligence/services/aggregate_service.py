@@ -9,6 +9,7 @@ from frappe import _
 
 from erp_intelligence.services.config_service import ConfigService
 from erp_intelligence.services.metadata_service import MetadataService
+from erp_intelligence.services.query_service import QueryService
 from erp_intelligence.services.query_validator import QueryValidator
 from erp_intelligence.utils.response_utils import build_collection_response
 
@@ -32,6 +33,7 @@ class AggregateService:
             "filters",
             "parent_doctype",
             "parent_fieldname",
+            "parent_names",
         }
     )
     _ALLOWED_AGGREGATION_KEYS = frozenset({"operation", "field"})
@@ -112,9 +114,33 @@ class AggregateService:
         if group_by:
             query_options["group_by"] = cls._build_group_by(group_by)
 
+        parent_context = None
+        accessible_parents: list[str] = []
+        is_child = bool(getattr(meta, "istable", False))
+        if is_child:
+            # Child rows carry none of the parent's row-level rules, so first ask which
+            # of the named parents this user may read (the check record queries use),
+            # and aggregate only the rows of those parents.
+            accessible_parents = QueryService.get_accessible_parent_names(plan)
+            parent_context = {
+                "parent_doctype": plan["parent_doctype"],
+                "parent_fieldname": plan["parent_fieldname"],
+                "requested_count": len(plan["parent_names"]),
+                "accessible_count": len(accessible_parents),
+            }
+            query_options["parent_doctype"] = plan["parent_doctype"]
+            query_options["filters"] = [
+                *query_options["filters"],
+                *QueryService.build_parent_filters(plan["doctype"], plan, accessible_parents),
+            ]
+
         # get_list applies Frappe's current-session record permission conditions
         # before the database performs grouping and aggregate calculations.
-        rows = frappe.get_list(plan["doctype"], **query_options)
+        if is_child and not accessible_parents:
+            # No readable parent: no child query runs and nothing is aggregated.
+            rows = []
+        else:
+            rows = frappe.get_list(plan["doctype"], **query_options)
         results = cls._normalize_results(
             rows,
             aggregations,
@@ -125,6 +151,13 @@ class AggregateService:
         # The query fetched one row beyond the group limit and _normalize_results
         # raises if that row exists, so any response built here contains every
         # group. truncated=False is therefore an established fact, not a default.
+        extra: dict[str, Any] = {
+            "group_by": group_by,
+            "aggregations": aggregations,
+            "group_limit": limits["returned_groups"] if group_by else 1,
+        }
+        if parent_context is not None:
+            extra["parent_context"] = parent_context
         try:
             return build_collection_response(
                 "aggregation",
@@ -132,11 +165,7 @@ class AggregateService:
                 item_key="results",
                 doctype=plan["doctype"],
                 truncated=False,
-                extra={
-                    "group_by": group_by,
-                    "aggregations": aggregations,
-                    "group_limit": limits["returned_groups"] if group_by else 1,
-                },
+                extra=extra,
             )
         except (TypeError, ValueError):
             frappe.throw(
@@ -311,6 +340,7 @@ class AggregateService:
             "offset": 0,
             "parent_doctype": request.get("parent_doctype"),
             "parent_fieldname": request.get("parent_fieldname"),
+            "parent_names": request.get("parent_names"),
         }
 
     @staticmethod
@@ -322,14 +352,25 @@ class AggregateService:
             )
 
         if bool(getattr(meta, "istable", False)):
-            frappe.throw(
-                _(
-                    "Direct child DocType aggregation cannot enforce parent record permissions safely"
-                ),
-                frappe.PermissionError,
-            )
-
-        if plan.get("parent_doctype") is not None or plan.get("parent_fieldname") is not None:
+            # A child DocType is aggregated only with a complete, validated parent
+            # context (parent DocType, table field and explicit parent names). Without
+            # it the rows' parent permissions cannot be enforced.
+            if not (
+                plan.get("parent_doctype")
+                and plan.get("parent_fieldname")
+                and plan.get("parent_names")
+            ):
+                frappe.throw(
+                    _(
+                        "Direct child DocType aggregation cannot enforce parent record permissions safely"
+                    ),
+                    frappe.PermissionError,
+                )
+        elif (
+            plan.get("parent_doctype") is not None
+            or plan.get("parent_fieldname") is not None
+            or plan.get("parent_names") is not None
+        ):
             frappe.throw(
                 _("Parent context is not valid for this aggregation"),
                 frappe.ValidationError,

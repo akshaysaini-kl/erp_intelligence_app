@@ -201,6 +201,23 @@ class QueryService:
 
         return [name for name in requested if name in accessible]
 
+    # Public aliases for reuse by other executors (child-table aggregation). They
+    # delegate to the private implementations without changing behavior.
+    @classmethod
+    def get_accessible_parent_names(cls, plan: Mapping[str, Any]) -> list[str]:
+        """Return the requested parent names the current user may read, in request order."""
+        return cls._get_accessible_parent_names(plan)
+
+    @classmethod
+    def build_parent_filters(
+        cls,
+        doctype: str,
+        plan: Mapping[str, Any],
+        accessible_parents: list[str],
+    ) -> list[list[Any]]:
+        """Return the filters that restrict child rows to readable parents of the stated table."""
+        return cls._build_parent_filters(doctype, plan, accessible_parents)
+
     @staticmethod
     def _build_parent_filters(
         doctype: str,

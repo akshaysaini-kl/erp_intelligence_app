@@ -215,7 +215,11 @@ class QueryValidator:
         if metadata.get("istable"):
             if not parent_doctype or not parent_fieldname:
                 frappe.throw(
-                    _("Child DocType queries require parent context"),
+                    _(
+                        "Child DocType queries require parent context. Use intelligence_request "
+                        "with parent_context (parent_doctype and parent_names: the parent DocType "
+                        "and the exact parent document names) to read or total child rows."
+                    ),
                     frappe.ValidationError,
                 )
             cls._validate_field_identifier(parent_fieldname)
@@ -308,7 +312,7 @@ class QueryValidator:
             ):
                 frappe.throw(_("Invalid parent document name"), frappe.ValidationError)
             if name in seen:
-                frappe.throw(_("Duplicate parent document name"), frappe.ValidationError)
+                frappe.throw(_("Duplicate parent document name: {0}. Send each parent name once.").format(name), frappe.ValidationError)
             seen.add(name)
             normalized.append(name)
 

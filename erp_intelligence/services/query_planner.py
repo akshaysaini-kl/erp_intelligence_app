@@ -88,9 +88,18 @@ class QueryPlanner:
             )
 
         if "parent_context" in request:
+            if plan_type == "aggregation":
+                # Grouped aggregation over the child rows of explicitly named parents,
+                # for example sum(qty) per item_code over a list of Sales Orders.
+                return cls._plan_child_group_aggregation(
+                    request,
+                    authenticated_user,
+                    limits,
+                    limit_snapshot,
+                )
             if plan_type != "records":
                 frappe.throw(
-                    _("parent_context is only supported for record requests"),
+                    _("parent_context is only supported for record and aggregation requests"),
                     frappe.ValidationError,
                 )
             return cls._plan_child_records(
@@ -345,6 +354,150 @@ class QueryPlanner:
             "parent_names": validated["parent_names"],
         }
         return cls._ready_response("records", child_doctype, plan, resolutions)
+
+    @classmethod
+    def _plan_child_group_aggregation(
+        cls,
+        request: Mapping[str, Any],
+        user: str,
+        limits: Mapping[str, int],
+        limit_snapshot: Mapping[str, int],
+    ) -> dict[str, Any]:
+        """Plan an aggregation over one child table of explicitly named parents.
+
+        The parents are named in ``parent_context``, exactly as for child record reads.
+        The executor keeps only the parents the user may read. The plan type stays
+        ``aggregation``: the plan carries the parent context and AggregateService runs it.
+        """
+        parent_reference, _parent_names = cls._validate_parent_context_shape(
+            request["parent_context"]
+        )
+        parent_resolution = ContextService.resolve_doctype(parent_reference, user=user)
+        if parent_resolution.get("match_status") != "resolved":
+            issue = cls._resolution_issue(
+                "/parent_context/parent_doctype",
+                parent_reference,
+                parent_resolution,
+            )
+            return cls._non_executable_response("aggregation", issues=[issue], resolutions=[])
+        parent_value = parent_resolution.get("resolved_value")
+        if not isinstance(parent_value, Mapping) or not isinstance(parent_value.get("name"), str):
+            frappe.throw(
+                _("Unable to establish canonical DocType context"),
+                frappe.PermissionError,
+            )
+        parent_doctype = parent_value["name"]
+        cls._validate_execution_target(parent_doctype)
+        child_doctype, parent_fieldname, child_resolution = cls._resolve_child_doctype(
+            request["doctype"],
+            parent_doctype,
+        )
+        resolutions = [
+            cls._resolution_record(
+                "/parent_context/parent_doctype",
+                parent_reference,
+                parent_doctype,
+                parent_resolution,
+            ),
+            cls._resolution_record(
+                "/doctype",
+                request["doctype"],
+                child_doctype,
+                child_resolution,
+            ),
+        ]
+        parent = {"parent_doctype": parent_doctype, "parent_fieldname": parent_fieldname}
+        issues: list[dict[str, Any]] = []
+        cache: dict[str, dict[str, Any]] = {}
+        aggregations = []
+        for index, aggregation in enumerate(request["aggregations"]):
+            operation = aggregation["operation"].lower()
+            fieldname = cls._resolve_field_reference(
+                child_doctype,
+                aggregation["field"],
+                f"/aggregations/{index}/field",
+                user,
+                cache,
+                issues,
+                resolutions,
+                parent,
+            )
+            if fieldname is not None:
+                aggregations.append({"operation": operation, "field": fieldname})
+        group_by = cls._resolve_field_list(
+            child_doctype,
+            request.get("group_by", []),
+            "/group_by",
+            user,
+            cache,
+            issues,
+            resolutions,
+            parent,
+        )
+        filters = cls._resolve_filters(
+            child_doctype,
+            request.get("filters", []),
+            user,
+            cache,
+            issues,
+            resolutions,
+            parent,
+        )
+        if issues:
+            return cls._non_executable_response(
+                "aggregation",
+                issues=issues,
+                resolutions=resolutions,
+                doctype=child_doctype,
+            )
+        cls._validate_aggregation_duplicates(aggregations, group_by)
+        referenced_fields = cls._unique_fields(
+            [*group_by, *(item["field"] for item in aggregations)]
+        )
+        # QueryValidator re-verifies the relationship from live metadata, applies
+        # FieldPolicy under the parent context, and enforces every limit.
+        validated = QueryValidator.validate_query(
+            {
+                "doctype": child_doctype,
+                "fields": referenced_fields,
+                "filters": filters,
+                "sort": [],
+                "page_length": 1,
+                "offset": 0,
+                "parent_doctype": parent_doctype,
+                "parent_fieldname": parent_fieldname,
+                "parent_names": request["parent_context"]["parent_names"],
+            },
+            user=user,
+            limit_snapshot=limit_snapshot,
+        )
+        cls._validate_aggregation_field_types(child_doctype, aggregations)
+        complexity = AggregateService.enforce_complexity_limit(
+            aggregations,
+            group_by,
+            validated["filters"],
+            limits["aggregate_complexity"],
+        )
+        plan = {
+            "doctype": validated["doctype"],
+            "aggregations": aggregations,
+            "group_by": group_by,
+            "filters": validated["filters"],
+            "parent_doctype": validated["parent_doctype"],
+            "parent_fieldname": validated["parent_fieldname"],
+            "parent_names": validated["parent_names"],
+        }
+        return cls._ready_response(
+            "aggregation",
+            child_doctype,
+            plan,
+            resolutions,
+            planning_metadata={
+                "complexity": complexity,
+                "complexity_limit": limits["aggregate_complexity"],
+                "group_limit": limits["returned_groups"],
+            },
+        )
 
     @classmethod
     def _validate_parent_context_shape(cls, value: Any) -> tuple[str, list[Any]]:
